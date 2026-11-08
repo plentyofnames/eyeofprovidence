@@ -310,8 +310,16 @@ export function pushRules(p, c) {
     upper: { enabled: true },
     link: { enabled: key ? c < CELLS - 1 : c < KNOBS - 1 },
   };
-  if (t === PT.NOTE) r.number = { ...r.number, kind: 'note', label: 'Note' };
-  if (t === PT.CC) r.number.label = 'CC number';
+  if (t === PT.NOTE) {
+    r.number = { ...r.number, kind: 'note', label: 'Note' };
+    r.lower = { ...r.lower, label: 'Note-off vel.', hint: '0: no note off' };
+    r.upper = { ...r.upper, label: 'Velocity', hint: '0 = 127' };
+  }
+  if (t === PT.CC) {
+    r.number.label = 'CC number';
+    r.lower = { ...r.lower, label: 'Off value' };
+    r.upper = { ...r.upper, label: 'On value' };
+  }
   if (p.off) {
     for (const k of Object.keys(r)) r[k] = { ...r[k], enabled: false };
   } else if (t >= PT.ACC0) {
@@ -364,7 +372,13 @@ export function setEncoderRec(r, c, field, value) {
     case 'type': {
       const t = v >= 0 && v <= 8 ? v : T.OFF;
       if (t !== T.OFF && encoderBlank(r)) {
-        r.set([0x00, DEFAULT_CC(c), 0, 0, 127, (4 << 4) | 1, 0], 0); // ch 1, Acc1, 0-127
+        // a blank knob switched on: ch 1, Acc1, display 0-127, the whole range of its type
+        r.set([0x00, DEFAULT_CC(c), 0, 0, 127, (4 << 4) | 1, 0], 0);
+        r[0] = nib(r[0], true, t);
+        if (t === T.CCAH) r[1] = 1 + (c % 31); // MSB numbers 1-31 (0 is bank select)
+        if (decodeEncoder(r).hires) setLowerUpper(r, 'upper', HIRES_MAX, true);
+        enforceRanges(r);
+        break;
       }
       const lo = e.lower;
       const up = e.upper;
@@ -437,7 +451,7 @@ export function setPushRec(r, c, field, value) {
       if (t !== PT.OFF && pushBlank(r)) {
         r[7] = 0x00; // channel 1
         r[12] = isKey(c) ? DEFAULT_NOTE(c) : DEFAULT_CC(c); // key mode
-        r[13] = 0x80; // display on, lower 0
+        r[13] = 0x80 | (t === PT.NOTE ? 64 : 0); // display on; a note's off velocity 64, a CC's off 0
         r[14] = 127; // no link, upper 127
       }
       r[7] = nib(r[7], true, t);
@@ -547,7 +561,7 @@ export const TABLE_C = {
 
 export function readSyncHeader(img) {
   const h = img.slice(A.SYNC, A.SYNC + 8);
-  const valid = h[0] === 0x46 && h[1] === 0x48 && h[2] === 0x32 && h[3] === 2;
+  const valid = h[0] === 0x46 && h[1] === 0x48 && h[2] === 0x32 && (h[3] === 1 || h[3] === 2); // as the firmware
   const blank = h.every((b) => b === 0xFF);
   return { bytes: h, valid, blank, format: h[3], version: h[5], dest: h[6], program: h[7] };
 }

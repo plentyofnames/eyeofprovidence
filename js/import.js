@@ -145,8 +145,10 @@ export function applyImport(bcr, src, groups) {
     // Night Shift's knobs go to the FH-2 on USB: the page keeps (or gets back) FF, all outputs.
     bcr[M.A.OUTPUTS + p] = 0xFF;
   }
-  if (done.cells.length && src.hasTables) {
-    const h = img.slice(EC4.SYNC_HEADER, EC4.SYNC_HEADER + 8);
+  const eh = img.slice(EC4.SYNC_HEADER, EC4.SYNC_HEADER + 8);
+  const headerOk = eh[0] === 0x46 && eh[1] === 0x48 && eh[2] === 0x32 && (eh[3] === 1 || eh[3] === 2);
+  if (done.cells.length && src.hasTables && headerOk) { // a blank EC4 header leaves the BCR32's alone
+    const h = eh;
     h[4] = 0;
     bcr.set(h, M.A.SYNC);
     done.header = true;

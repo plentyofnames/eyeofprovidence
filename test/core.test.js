@@ -569,17 +569,90 @@ test('live link: TOUCH and STATE events, EDIT for the page in view', async () =>
   dev.close();
 });
 
-test('store: a fresh read keeps the editor\'s own edits as changes', () => {
+// What app.js's edit() does: one undo step, its addresses marked as the editor's own.
+function edited(st, h, fn) {
+  const step = h.record(fn);
+  if (step) st.touch(step.changes.keys());
+  return step;
+}
+
+test('store: a fresh read keeps only the bytes edited here', () => {
   const st = new Store();
+  const h = new History(st.img);
   const dev = demoImage();
-  eq(st.fromDevice(dev), false, 'empty editor takes the device');
+  eq(st.fromDevice(dev), 0, 'empty editor takes the device');
   eqBytes(st.img, dev);
-  M.setName(st.img, 0, 0, 'MINE');
-  eq(st.fromDevice(dev), true, 'edits kept');
+  edited(st, h, () => M.setName(st.img, 0, 0, 'MINE'));
+  eq(st.fromDevice(dev) > 0, true, 'edits kept');
   eq(M.cellName(st.img, 0, 0), 'MINE');
-  assert(st.deviceDirtyBytes() > 0, 'pending');
+  assert(st.deviceDirtyBytes() > 0 && st.deviceDirtyBytes() <= 4, 'only the name is pending');
   st.revertToDevice();
   eq(st.deviceDirtyBytes(), 0, 'reverted');
+});
+
+test('store: content you never edited is never sent (another unit, a partial import)', () => {
+  const st = new Store();
+  const h = new History(st.img);
+  st.fromDevice(demoImage()); // the demo, read
+  edited(st, h, () => M.setName(st.img, 0, 1, 'ABCD')); // one edit
+  const other = M.blankImage(); // then another, blank unit
+  const kept = st.fromDevice(other);
+  eq(kept > 0 && kept <= 4, true, `only the edited name is kept (${kept})`);
+  for (const c of st.deviceChunks()) for (let a = c.addr; a < c.addr + c.data.length; a++) {
+    const w = M.locate(a);
+    assert(w.page === 0 && (w.cell === 1 || st.img[a] === other[a]), `nothing of the demo goes out (0x${a.toString(16)})`);
+  }
+  // an edit made before any read: only it survives the first read
+  const st2 = new Store();
+  const h2 = new History(st2.img);
+  edited(st2, h2, () => M.setName(st2.img, 2, 0, 'NEW '));
+  st2.fromDevice(demoImage());
+  eq(M.cellName(st2.img, 2, 0), 'NEW', 'the edit stays');
+  eq(M.cellName(st2.img, 0, 0), M.cellName(demoImage(), 0, 0), 'the rest is the device');
+});
+
+test('store: an opened file is kept whole; Send commits only after it is stored', () => {
+  const st = new Store();
+  const h = new History(st.img);
+  const file = demoImage();
+  edited(st, h, () => st.img.set(file));
+  st.touchAll(); // as openFile does
+  const dev = M.blankImage();
+  st.fromDevice(dev);
+  eqBytes(st.img, file, 'the file survives the connect');
+  const chunks = st.deviceChunks();
+  assert(chunks.length > 0, 'all of it to send');
+  st.committed(chunks.slice(0, 1)); // say only part was stored (as if RELOAD answered for that)
+  eq(st.touched.size, 0, 'nothing is the editor\'s own after a stored Send');
+  const st3 = new Store();
+  st3.fromDevice(dev);
+  const h3 = new History(st3.img);
+  edited(st3, h3, () => M.setName(st3.img, 0, 0, 'XYZ '));
+  const c3 = st3.deviceChunks();
+  // a Send whose RELOAD failed commits nothing: still to send
+  eq(st3.deviceDirtyBytes() > 0, true, 'pending until RELOAD answers');
+  st3.committed(c3);
+  eq(st3.deviceDirtyBytes(), 0, 'stored');
+});
+
+test('defaults: a blank knob switched to 14-bit gets the whole range; a note key its note off', () => {
+  const img = M.blankImage();
+  M.setEncoder(img, 0, 20, 'type', M.T.CCAH);
+  const e = M.readCell(img, 0, 20).enc;
+  eq(e.hires, true, '14-bit');
+  eq(e.upper, M.HIRES_MAX, 'upper 16383');
+  eq(e.lower, 0, 'lower 0');
+  assert(e.number >= 1 && e.number <= 31, `MSB number 1-31 (${e.number})`);
+  eq(e.mode, 4, 'Acc1');
+  M.setEncoder(img, 0, 21, 'type', M.T.CCAB);
+  const e7 = M.readCell(img, 0, 21).enc;
+  eq(e7.upper, 127, '7-bit: 0-127');
+  eq(e7.mode, 4, 'Acc1 too');
+  M.setPush(img, 0, M.keyCell(3), 'type', M.PT.NOTE);
+  const pu = M.readCell(img, 0, M.keyCell(3)).push;
+  eq(pu.lower, 64, 'a note key sends its note off at velocity 64');
+  M.setPush(img, 0, M.keyCell(4), 'type', M.PT.CC);
+  eq(M.readCell(img, 0, M.keyCell(4)).push.lower, 0, 'a CC key: off value 0');
 });
 
 // load(path) returns a file's bytes, or null (for optional local files; none needed now).

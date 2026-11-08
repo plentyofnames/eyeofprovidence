@@ -103,21 +103,20 @@ let progressTimer = 0;
 function progress() {
   if (!progressTimer) progressTimer = setTimeout(() => ((progressTimer = 0), renderStatus()), 100);
 }
-function checkJob(j) {
-  if (j.cancelled) throw new Error('cancelled');
-  if (!S.conn) throw new Error('BCR32 disconnected.');
-}
 
 // ------------------------------------------------------------------ edits
 
 // Every change goes through here: one undo step each (typing a name merges by `key`). The
 // first edit of a blank image gives it its header.
-function edit(fn, { key = null, label = '' } = {}) {
+function edit(fn, { key = null, label = '', header = true } = {}) {
   const step = S.history.record(() => {
     fn();
-    M.ensureHeader(img());
+    if (header) M.ensureHeader(img());
   }, { key, label });
-  if (step) edited();
+  if (step) {
+    S.store.touch(step.changes.keys());
+    edited();
+  }
   return step;
 }
 function edited() {
@@ -131,23 +130,63 @@ function scheduleRender() {
   if (!renderPending) renderPending = setTimeout(() => ((renderPending = 0), renderAll()), 0);
 }
 
+// What waits to be sent, in plain words: "3 knobs, 1 key, page settings".
+function changeSummary() {
+  const st = S.store;
+  if (!st.dev) return '';
+  const cells = new Set();
+  let other = false;
+  for (let a = 0; a < M.SIZE; a++) {
+    if (!st.isDeviceDirty(a)) continue;
+    const w = M.locate(a);
+    if (w.cell !== undefined) cells.add(w.page * 64 + w.cell); // a knob's FH-2 entry counts as the knob
+    else other = true;
+  }
+  let knobs = 0;
+  let keys = 0;
+  for (const k of cells) (k % 64 < M.KNOBS ? knobs++ : keys++);
+  return [knobs && plural(knobs, 'knob'), keys && plural(keys, 'key'), other && 'page settings'].filter(Boolean).join(', ');
+}
+
 const isDirty = (addr) => (S.store.dev ? S.store.isDeviceDirty(addr) : S.store.file ? M.writable(addr) && img()[addr] !== S.store.file[addr] : false);
 const cellDirty = (p, c) => M.cellAddrs(p, c).some(isDirty);
 const pageDirty = (p) => range(0, M.CELLS).some((c) => cellDirty(p, c)) || [M.pageNameAddr(p), M.pageNameAddr(p) + 1, M.pageNameAddr(p) + 2, M.pageNameAddr(p) + 3, M.A.OUTPUTS + p].some(isDirty);
 
 // ---- live edits: the page the BCR32 shows plays the editor's cells before Send (EDIT, RAM only)
 
-function syncEdits() {
-  const c = S.conn;
-  if (!c?.info || !S.prefs.liveEdit || !S.devState || !S.store.dev) return;
-  const p = S.devState.page;
-  for (let cell = 0; cell < M.CELLS; cell++) {
-    const rec = M.readRecord(img(), p, cell);
-    const key = toHex(rec);
-    const have = S.sent.get(cell) ?? toHex(M.readRecord(S.store.dev, p, cell));
-    if (key === have) continue;
-    S.sent.set(cell, key);
-    c.dev.edit(p, cell, rec).catch(() => {});
+// Paced: 8 EDITs, then a GET_STATE round trip, so a burst (a page change, a connect that kept
+// edits) never overruns the BCR32's SysEx input.
+let syncing = false;
+let syncAgain = false;
+async function syncEdits() {
+  if (syncing) {
+    syncAgain = true;
+    return;
+  }
+  syncing = true;
+  try {
+    do {
+      syncAgain = false;
+      const c = S.conn;
+      if (!c?.info || !S.prefs.liveEdit || !S.devState || !S.store.dev) return;
+      const p = S.devState.page;
+      let n = 0;
+      for (let cell = 0; cell < M.CELLS; cell++) {
+        const rec = M.readRecord(img(), p, cell);
+        const key = toHex(rec);
+        const have = S.sent.get(cell) ?? toHex(M.readRecord(S.store.dev, p, cell));
+        if (key === have) continue;
+        S.sent.set(cell, key);
+        c.dev.edit(p, cell, rec).catch(() => {});
+        if (++n % 8 === 0) await c.dev.getState().catch(() => {});
+        if (S.conn !== c || S.devState?.page !== p) {
+          syncAgain = true; // the page changed meanwhile: start over on the new one
+          break;
+        }
+      }
+    } while (syncAgain);
+  } finally {
+    syncing = false;
   }
 }
 
@@ -217,7 +256,8 @@ async function connect() {
   dev.addEventListener('state', onDeviceState);
   dev.addEventListener('touch', onDeviceTouch);
   // An EDIT can cross a page change on the BCR32 (7F 2C 01): the new page's STATE resends it.
-  dev.addEventListener('deviceerror', (e) => e.detail.cmd !== 0x2C && say(`BCR32 error ${e.detail.code} for 0x${e.detail.cmd.toString(16).toUpperCase()}`, 'error'));
+  const what = { 0x10: 'a read', 0x12: 'a write', 0x20: 'a state request', 0x22: 'a page select', 0x24: 'storing', 0x26: 'touch events', 0x28: 'a text', 0x2A: 'clearing texts' };
+  dev.addEventListener('deviceerror', (e) => e.detail.cmd !== 0x2C && say(`The BCR32 refused ${what[e.detail.cmd] ?? 'a message'} (error ${e.detail.code}).`, 'error'));
   say(`Connecting to ${transport.name}…`);
   renderAll();
   try {
@@ -232,12 +272,12 @@ async function connect() {
     await dev.touchEvents(true);
     const data = await job('Reading', (j) => dev.readAll((k, n) => ((j.done = k), (j.total = n), progress())));
     const kept = S.store.fromDevice(data);
+    S.history.clear(); // the image is the BCR32's now (plus your edits): undo starts here
     S.sent.clear();
     if (target === 'midi') S.prefs.lastPort = transport.name;
     savePrefs();
     if (S.devState.mode === 1 && S.view === 'pages') S.sel.page = S.devState.page;
-    const n = S.store.deviceDirtyBytes();
-    say(kept && n ? `Connected: Rotary Club ${info.fwMajor}.${info.fwMinor}. Your edits are kept: ${plural(n, 'byte')} to send.`
+    say(kept ? `Connected: Rotary Club ${info.fwMajor}.${info.fwMinor}. Your edits are kept: ${changeSummary()} to send.`
       : `Connected: Rotary Club ${info.fwMajor}.${info.fwMinor}.`, 'ok');
     renderAll();
     syncEdits();
@@ -274,7 +314,7 @@ function onDeviceState(e) {
     S.sent.clear();
     syncEdits();
   }
-  if (!solicited && S.prefs.follow && mode === 1 && S.view === 'pages' && page < M.PAGES) S.sel.page = page;
+  if (!solicited && S.prefs.follow && mode === 1 && S.view === 'pages' && page < M.PAGES && !typing()) S.sel.page = page;
   renderAll();
 }
 
@@ -306,31 +346,34 @@ async function send() {
     const st = S.store;
     const chunks = st.deviceChunks();
     if (!chunks.length) return say('Nothing to send: the BCR32 has it all.', 'ok');
-    const bytes = chunks.reduce((n, c) => n + c.data.length, 0);
+    const what = changeSummary();
     j.total = chunks.length;
     const t0 = performance.now();
-    let done = 0;
-    let err = null;
+    // Written into the BCR32's RAM first; only RELOAD makes it use and keep them. Until RELOAD
+    // answers, nothing counts as sent: Cancel or an error stores nothing, and Send tries again.
     for (const c of chunks) {
+      if (j.cancelled) throw new Error('Send cancelled: nothing stored.');
+      if (!S.conn) throw new Error('BCR32 disconnected: nothing stored.');
       try {
-        checkJob(j);
         await S.conn.dev.write(c.addr, c.data);
-        st.written(c.addr, c.data);
-        j.done = ++done;
-        progress();
       } catch (e) {
-        err = e;
-        break;
+        logLine('!', null, e.message);
+        throw new Error(j.cancelled ? 'Send cancelled: nothing stored.' : 'Send stopped: nothing stored. Send again.');
       }
+      j.done++;
+      progress();
     }
-    if (done && S.conn) {
-      j.label = 'Reloading';
+    j.label = 'Storing';
+    try {
       S.devState = await S.conn.dev.reload();
-      S.sent.clear(); // RELOAD drops the RAM edits; the image has them now
-      syncEdits();
+    } catch (e) {
+      logLine('!', null, e.message);
+      throw new Error('No reply while storing. Send again.');
     }
-    if (err) throw err;
-    say(`Sent ${plural(bytes, 'byte')} in ${plural(chunks.length, 'write')} (${((performance.now() - t0) / 1000).toFixed(1)} s). Stored.`, 'ok');
+    st.committed(chunks);
+    S.sent.clear(); // RELOAD drops the RAM edits; the image has them now
+    syncEdits();
+    say(`Sent ${what} (${((performance.now() - t0) / 1000).toFixed(1)} s). Stored.`, 'ok');
   });
 }
 
@@ -339,17 +382,17 @@ async function reread() {
   await job('Reading', async (j) => {
     const data = await S.conn.dev.readAll((k, n) => ((j.done = k), (j.total = n), progress()));
     const kept = S.store.fromDevice(data);
+    S.history.clear();
     S.sent.clear();
     syncEdits();
-    const n = S.store.deviceDirtyBytes();
-    say(kept && n ? `Read. Your edits stay: ${plural(n, 'byte')} to send.` : 'Read.', 'ok');
+    say(kept ? `Read. Your edits stay: ${changeSummary()} to send.` : 'Read.', 'ok');
   }).catch(showError);
 }
 
 function discard() {
   const base = S.store.dev ?? S.store.file;
   if (!base) return;
-  if (edit(() => img().set(base), { label: 'discard' })) say(`Back to ${S.store.dev ? 'the BCR32' : S.store.fileName}. ⌘Z brings the edits back.`);
+  if (edit(() => img().set(base), { label: 'discard', header: false })) say(`Back to ${S.store.dev ? 'the BCR32' : S.store.fileName}. ⌘Z brings the edits back.`);
 }
 
 // ------------------------------------------------------------------ files
@@ -392,12 +435,13 @@ async function openFile(file) {
   if (/\.syx$/i.test(file.name) || data[0] === 0xF0) return importSyx(file, data);
   if (data.length !== M.SIZE) return say(`${file.name}: ${data.length} bytes; a backup is 4096.`, 'error');
   edit(() => img().set(data), { label: 'open ' + file.name });
+  S.store.touchAll(); // the whole file is what you want, not only the bytes it changed here
   S.store.file = Uint8Array.from(data);
   S.store.fileName = file.name;
   S.store.loaded = true;
   S.view = 'pages';
   const n = S.store.deviceDirtyBytes();
-  say(`Opened ${file.name}${M.hasHeader(data) || M.isBlank(data) ? '' : ' (no BCRC header)'}${S.conn?.info && n ? `: ${plural(n, 'byte')} to send` : ''}.`, 'ok');
+  say(`Opened ${file.name}${M.hasHeader(data) || M.isBlank(data) ? '' : ' (no BCRC header)'}${S.conn?.info && n ? `: ${changeSummary()} to send` : ''}.`, 'ok');
   renderAll();
 }
 
@@ -431,9 +475,15 @@ async function readEc4From(makeDevice, label) {
   try {
     await job(label, async (j) => {
       dev = await makeDevice();
+      S.imp.dev = dev; // Cancel aborts this one, not the BCR32's
       const info = await dev.identify({ busyMs: 4000 });
       j.label = `Reading EC4 (controlfrog ${info.fwMajor}.${info.fwMinor})`;
-      const src = await I.readEc4(dev, (k, n) => ((j.done = k), (j.total = n), progress()));
+      const src = await I.readEc4(dev, (k, n) => {
+        if (j.cancelled) throw new Error('cancelled');
+        j.done = k;
+        j.total = n;
+        progress();
+      });
       setSource(src);
       say(`Read the EC4's setup 15: ${plural(S.imp.scan.groups.filter((g) => !g.empty).length, 'page')}.`, 'ok');
     });
@@ -441,6 +491,7 @@ async function readEc4From(makeDevice, label) {
     showError(e.name === 'TimeoutError' ? new Error('No reply from the EC4. Is controlfrog running, and Lilypad closed?') : e);
   } finally {
     dev?.close();
+    S.imp.dev = null;
     S.imp.busy = false;
     renderAll();
   }
@@ -530,6 +581,7 @@ function pasteCell() {
 function undoRedo(redo) {
   const step = redo ? S.history.redo() : S.history.undo();
   if (!step) return;
+  S.store.touch(step.changes.keys());
   const where = M.locate(step.changes.keys().next().value);
   if (where.page !== undefined && S.view === 'pages') {
     S.sel.page = where.page;
@@ -563,7 +615,8 @@ function renderToolbar() {
   chip.textContent = info ? `${c.name} · ${info.fwMajor}.${info.fwMinor}` : c ? 'connecting…' : S.store.fileName ? 'offline · ' + S.store.fileName : 'offline';
   const send = $('#send');
   send.disabled = !info || busy || !n;
-  send.textContent = info && n ? `Send ${plural(n, 'byte')}` : 'Send';
+  send.textContent = 'Send';
+  send.title = info && n ? `Write ${changeSummary()} to the BCR32 and store them` : 'Write the changes to the BCR32 and store them';
   $('#reread').disabled = !info || busy;
   $('#undo').disabled = !S.history.canUndo;
   $('#redo').disabled = !S.history.canRedo;
@@ -617,7 +670,7 @@ function pageBar() {
     M.OUTPUTS.map((o) => h('button', { class: outs & o.bit ? 'on' : '', title: o.label, onclick: () => edit(() => M.toggleOutput(img(), p, o.bit), { label: `page ${p + 1} ${o.label}` }) }, o.short)));
   const hd = M.readSyncHeader(img());
   const n = M.syncCount(img());
-  const sync = hd.valid ? `FH-2: dump ${hd.version} · ${['', 'USB', 'DIN', 'both'][hd.dest] ?? 'USB'} · PC ${hd.program >= 1 && hd.program <= 16 ? 'ch ' + hd.program : 'off'} · ${plural(n, 'knob')}`
+  const sync = hd.valid ? `FH-2 sync · ${['', 'USB', 'DIN', 'both'][hd.dest] ?? 'USB'} · scenes on ${hd.program >= 1 && hd.program <= 16 ? 'PC ch ' + hd.program : 'no PC'} · ${plural(n, 'knob')}`
     : hd.blank ? (n ? `FH-2: no header · ${plural(n, 'entry')}` : 'FH-2: none') : `FH-2: header ${toHex(hd.bytes.slice(0, 4))}?`;
   return h('div', { class: 'pagebar' },
     tabs,
@@ -625,8 +678,9 @@ function pageBar() {
       h('label', { class: 'pname' }, 'Name ', nameInput('pagename', M.pageName(img(), p), (v) => edit(() => M.writeName(img(), M.pageNameAddr(p), v), { key: 'pagename' + p, label: `page ${p + 1} name` }), false, '····')),
       h('span', { class: 'lbl' }, 'Out'), outputs,
       h('span', { class: 'sync' + (hd.valid ? ' on' : ''), title: hd.valid ? `header ${toHex(hd.bytes)}` : '' }, sync),
-      hd.valid || n ? h('button', { class: 'small', title: 'Remove the header and every entry (undoable)', onclick: removeAllSync }, 'Remove FH-2') : null,
-      S.conn?.info ? h('button', { class: 'small', title: 'SELECT this page on the BCR32', onclick: () => S.conn.dev.select(p).catch(showError) }, 'Show on BCR32') : null));
+      hd.valid || n ? h('button', { class: 'small', title: 'Remove the FH-2 sync from every page (undoable)', onclick: removeAllSync }, 'Remove FH-2 (all pages)') : null,
+      // SELECT loads the page again on the BCR32, which drops the played edits: send them again
+      S.conn?.info ? h('button', { class: 'small', title: 'Show this page on the BCR32', onclick: () => S.conn.dev.select(p).then(() => (S.sent.clear(), syncEdits())).catch(showError) }, 'Show on BCR32') : null));
 }
 
 function selectPage(q) {
@@ -775,7 +829,7 @@ function renderInspector() {
     h('span', { class: 'acts' },
       h('button', { class: 'small', onclick: copyCell, title: 'Copy this cell (⌘C)' }, 'Copy'),
       h('button', { class: 'small', onclick: pasteCell, disabled: !clip, title: clip ? `Paste ${clip.from} (⌘V)` : 'Nothing copied' }, 'Paste'),
-      h('button', { class: 'small', onclick: () => edit(() => M.clearCell(img(), p, c), { label: `clear ${M.cellLabel(c)}` }), disabled: cell.blank, title: 'Make it blank (FF): off' }, 'Clear')));
+      h('button', { class: 'small', onclick: () => edit(() => (M.clearCell(img(), p, c), c < M.KNOBS && M.removeSync(img(), p, c)), { label: `clear ${M.cellLabel(c)}` }), disabled: cell.blank, title: 'Nothing on it, no FH-2 entry' }, 'Clear')));
   const nameRow = row('Name', nameInput('cellname', cell.name, (v) => edit(() => M.setName(img(), p, c, v), { key: `name${p}/${c}`, label: `name of ${M.cellLabel(c)}` }), false, '····'));
   const parts = [title, h('div', { class: 'fields' }, nameRow)];
   if (!key) parts.push(h('h3', {}, 'Turn'), h('div', { class: 'fields' }, encoderFields(p, c, cell.enc)));
@@ -832,8 +886,8 @@ function pushFields(p, c, pu) {
   else out.push(row(r.number.label, numField('pnumber', pu.number, 0, 127, set('number'), !r.number.enabled), { enabled: r.number.enabled, hint: r.number.enabled ? '0–127' : '' }));
   out.push(row('Mode', selectField('pmode', M.PUSH_MODES.map((t, v) => ({ value: v, label: t.label })), pu.mode, set('mode'), !r.mode.enabled), { enabled: r.mode.enabled }));
   out.push(row('Display', check('pdisplay', pu.display, r.display.enabled, key ? 'LED shows the state' : 'ring shows the state', set('display')), { enabled: r.display.enabled }));
-  out.push(row('Lower', numField('plower', pu.lower, 0, 127, set('lower'), !r.lower.enabled), { enabled: r.lower.enabled, hint: r.lower.enabled ? '0–127' : '' }));
-  out.push(row('Upper', numField('pupper', pu.upper, 0, 127, set('upper'), !r.upper.enabled), { enabled: r.upper.enabled, hint: r.upper.enabled ? '0–127' : '' }));
+  out.push(row(r.lower.label ?? 'Lower', numField('plower', pu.lower, 0, 127, set('lower'), !r.lower.enabled), { enabled: r.lower.enabled, hint: r.lower.enabled ? (r.lower.hint ?? '0–127') : '' }));
+  out.push(row(r.upper.label ?? 'Upper', numField('pupper', pu.upper, 0, 127, set('upper'), !r.upper.enabled), { enabled: r.upper.enabled, hint: r.upper.enabled ? (r.upper.hint ?? '0–127') : '' }));
   out.push(row('Link', check('plink', pu.link, r.link.enabled, r.link.enabled ? `with ${key ? 'key' : 'push'} ${(key ? c - M.KNOBS : c) + 2}` : key ? 'last key' : 'last knob', set('link')), { enabled: r.link.enabled }));
   return out;
 }
@@ -894,7 +948,7 @@ function importView() {
   out.push(h('div', { class: 'imp-list' }, rows));
   const warns = [];
   if (scan.beyond.length) warns.push(`Groups ${scan.beyond.map((b) => b.g + 1).join(', ')} hold pages too; they don't fit.`);
-  if (scan.headerOk && scan.format !== 2) warns.push(`The EC4's table is format ${scan.format}; the BCR32 reads format 2.`);
+  if (scan.headerOk && scan.format !== 1 && scan.format !== 2) warns.push(`The EC4's table is format ${scan.format}; the BCR32 reads formats 1 and 2.`);
   if (src.hasTables && !src.hasTableC) warns.push('controlfrog before 0.13: no table C.');
   if (scan.setupName && scan.setupName.trim() !== 'FH-2') warns.push(`Setup 15 is “${scan.setupName}”, not Night Shift's “FH-2”.`);
   if (warns.length) out.push(h('div', { class: 'warn' }, warns.join(' ')));
@@ -916,9 +970,9 @@ function renderStatus() {
     prog = h('div', { class: 'job' },
       h('span', {}, j.label + (j.total ? ` · ${j.done}/${j.total}` : '')),
       h('progress', { max: 1, value: j.total ? j.done / j.total : 0 }),
-      h('button', { class: 'small', onclick: () => ((j.cancelled = true), S.conn?.dev.abort()) }, 'Cancel'));
+      h('button', { class: 'small', onclick: () => ((j.cancelled = true), S.imp.dev ? S.imp.dev.abort() : S.conn?.dev.abort()) }, 'Cancel'));
   }
-  const pend = S.store.dev && S.conn ? (n ? `${plural(n, 'byte')} to send` : 'BCR32 up to date') : S.store.unsaved() ? 'unsaved' : '';
+  const pend = S.store.dev && S.conn ? (n ? `${changeSummary()} to send` : 'BCR32 up to date') : S.store.unsaved() ? 'unsaved' : '';
   const ds = S.devState;
   replace($('#status'),
     h('div', { class: 'msg ' + (msg?.kind || '') }, msg?.text || ''),

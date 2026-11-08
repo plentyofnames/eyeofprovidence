@@ -1,6 +1,9 @@
 // The editor's 4 KB image and two baselines: what the BCR32 holds (for Send, which writes only
 // the changed ranges) and what the opened or saved file held (for "unsaved"). After Lilypad's
 // store.js, without its 64-byte pages: the controller space is read whole.
+//
+// `touched`: the addresses edited here since the last read or Send (an opened file: all of them).
+// A read keeps exactly those, as changes to send; every other byte becomes the BCR32's.
 
 import { SIZE, writable, blankImage } from './model.js';
 import { MAX_CHUNK } from './proto.js';
@@ -12,16 +15,33 @@ export class Store {
     this.file = null; // the last opened or saved file's image
     this.fileName = '';
     this.loaded = false; // anything in the editor yet (device, file, import, edit)
+    this.touched = new Set();
   }
 
-  // A fresh read of the whole space. The editor takes it unless it holds edits of its own,
-  // which then become changes to send.
+  touch(addrs) {
+    for (const a of addrs) if (writable(a)) this.touched.add(a);
+  }
+  touchAll() {
+    for (let a = 0; a < SIZE; a++) if (writable(a)) this.touched.add(a);
+  }
+
+  // A fresh read of the whole space: the BCR32's image, with the bytes edited here (and not on
+  // the BCR32) kept as changes to send. Returns how many bytes were kept.
   fromDevice(data, { keepEdits = true } = {}) {
-    const mine = keepEdits && this.loaded && this.hasOwnEdits();
+    const next = Uint8Array.from(data);
+    const keep = keepEdits ? [...this.touched].filter((a) => this.img[a] !== data[a]) : [];
+    for (const a of keep) next[a] = this.img[a];
     this.dev = Uint8Array.from(data);
-    if (!mine) this.img.set(data);
+    this.img.set(next);
+    this.touched = new Set(keep);
     this.loaded = true;
-    return mine;
+    return keep.length;
+  }
+
+  // Sent and stored (RELOAD answered): the BCR32 holds these now; nothing is the editor's own.
+  committed(chunks) {
+    for (const c of chunks) this.dev?.set(c.data, c.addr);
+    this.touched.clear();
   }
 
   // Edits not on the device and not in a file: what a fresh read must not throw away.
@@ -47,6 +67,7 @@ export class Store {
 
   revertToDevice() {
     if (this.dev) this.img.set(this.dev);
+    this.touched.clear();
   }
 
   deviceChunks() {
