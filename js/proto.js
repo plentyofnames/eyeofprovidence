@@ -30,8 +30,10 @@ export const ERR = {
   1: 'bad length or format',
   2: 'bad range or checksum',
   3: 'busy',
+  4: 'the image could not be stored', // RELOAD: in use until power-off, but not kept
   5: 'unknown command',
 };
+export const ERR_STORE = 4;
 
 export const SPACE = { INTERNAL: 0, FLASH: 1, CONTROLLER: 2 };
 

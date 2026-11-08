@@ -1,9 +1,15 @@
-// The editor's 4 KB image and two baselines: what the BCR32 holds (for Send, which writes only
-// the changed ranges) and what the opened or saved file held (for "unsaved"). After Lilypad's
-// store.js, without its 64-byte pages: the controller space is read whole.
+// The editor's 4 KB image and its baselines: what the BCR32 keeps in its store (for "to send"),
+// what its RAM holds (for Send, which writes only the ranges that differ), what its controller
+// plays (for the live EDITs), and what the opened or saved file held (for "unsaved"). After
+// Lilypad's store.js, without its 64-byte pages: the controller space is read whole.
 //
 // `touched`: the addresses edited here since the last read or Send (an opened file: all of them).
 // A read keeps exactly those, as changes to send; every other byte becomes the BCR32's.
+//
+// A Send WRITEs into the BCR32's RAM, and only RELOAD makes it use and keep them. A Send that
+// fails after a WRITE leaves bytes in its RAM that its store doesn't hold: they stay "to send"
+// (dev keeps the stored bytes), and a Read meanwhile keeps that baseline for them rather than
+// taking the RAM as what the BCR32 holds (review, 2026-11-08).
 
 import { SIZE, writable, blankImage } from './model.js';
 import { MAX_CHUNK } from './proto.js';
@@ -11,7 +17,10 @@ import { MAX_CHUNK } from './proto.js';
 export class Store {
   constructor() {
     this.img = blankImage(); // never replaced: History keeps a reference to it
-    this.dev = null; // the BCR32's image as last read or written
+    this.dev = null; // the BCR32's image as its store keeps it, as far as the editor knows
+    this.ram = null; // its image in RAM: dev, plus what a Send wrote before it failed
+    this.live = null; // what its controller plays: the image as it last loaded it (RELOAD, power-on)
+    this.connected = null; // its image as read when the session connected
     this.file = null; // the last opened or saved file's image
     this.fileName = '';
     this.loaded = false; // anything in the editor yet (device, file, import, edit)
@@ -31,17 +40,50 @@ export class Store {
     const next = Uint8Array.from(data);
     const keep = keepEdits ? [...this.touched].filter((a) => this.img[a] !== data[a]) : [];
     for (const a of keep) next[a] = this.img[a];
-    this.dev = Uint8Array.from(data);
+    const dev = Uint8Array.from(data);
+    if (this.dev && this.ram) {
+      // written but not kept: the RAM has the editor's bytes there, the store the old ones
+      for (let a = 0; a < SIZE; a++) if (this.ram[a] !== this.dev[a] && data[a] === this.ram[a]) dev[a] = this.dev[a];
+    }
+    this.dev = dev;
+    this.ram = Uint8Array.from(data);
+    if (!this.live) this.live = Uint8Array.from(data);
+    if (!this.connected) this.connected = Uint8Array.from(data);
     this.img.set(next);
     this.touched = new Set(keep);
     this.loaded = true;
     return keep.length;
   }
 
-  // Sent and stored (RELOAD answered): the BCR32 holds these now; nothing is the editor's own.
-  committed(chunks) {
-    for (const c of chunks) this.dev?.set(c.data, c.addr);
+  // A WRITE answered: the bytes are in the BCR32's RAM, not kept yet.
+  written(addr, bytes) {
+    this.ram?.set(bytes, addr);
+  }
+
+  // RELOAD answered 21: the BCR32 uses and keeps what its RAM holds; nothing is the editor's own.
+  committed() {
+    if (this.ram) {
+      this.dev = Uint8Array.from(this.ram);
+      this.live = Uint8Array.from(this.ram);
+    }
     this.touched.clear();
+  }
+
+  // RELOAD answered 7F 24 04: the BCR32 uses what its RAM holds, but could not keep it.
+  reloadedUnkept() {
+    if (this.ram) this.live = Uint8Array.from(this.ram);
+  }
+
+  // Bytes in the BCR32's RAM that its store doesn't hold (a Send that failed after a WRITE).
+  unkeptBytes() {
+    return this.dev && this.ram ? countDiff(this.ram, this.dev) : 0;
+  }
+
+  // A fresh link: what its controller plays is read again, and "as connected" starts over. What
+  // its RAM held stays as the baseline for a Send that failed before the link went.
+  forgetDevice() {
+    this.live = null;
+    this.connected = null;
   }
 
   // Edits not on the device and not in a file: what a fresh read must not throw away.
@@ -61,17 +103,14 @@ export class Store {
     this.fileName = name;
   }
 
-  written(addr, bytes) {
-    this.dev?.set(bytes, addr);
-  }
-
   revertToDevice() {
     if (this.dev) this.img.set(this.dev);
     this.touched.clear();
   }
 
+  // The WRITEs that make the BCR32's RAM hold the image.
   deviceChunks() {
-    return this.dev ? diffChunks(this.img, this.dev) : [];
+    return this.ram ? diffChunks(this.img, this.ram) : this.dev ? diffChunks(this.img, this.dev) : [];
   }
   deviceDirtyBytes() {
     return this.dev ? countDiff(this.img, this.dev) : 0;

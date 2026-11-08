@@ -2,13 +2,13 @@
 // the same jobs, log, history, cell editor and demo panel, laid out for the BCR32's pages.
 
 import * as M from './model.js';
-import { Store } from './store.js';
+import { Store, differs } from './store.js';
 import { Device } from './device.js';
 import { History } from './history.js';
 import { MockBcr32 } from './mock.js';
 import { demoImage, fakeNightShiftEc4 } from './demo.js';
 import { midiAccess, midiPermission, portPairs, midiTransport, EC4_NAME, BCR32_NAME } from './midi.js';
-import { hexdump } from './proto.js';
+import { hexdump, ERR_STORE } from './proto.js';
 import * as I from './import.js';
 import { Device as Ec4Device } from './ec4/device.js';
 import { MockDevice as MockEc4 } from './ec4/mock.js';
@@ -155,7 +155,8 @@ const pageDirty = (p) => range(0, M.CELLS).some((c) => cellDirty(p, c)) || [M.pa
 // ---- live edits: the page the BCR32 shows plays the editor's cells before Send (EDIT, RAM only)
 
 // Paced: 8 EDITs, then a GET_STATE round trip, so a burst (a page change, a connect that kept
-// edits) never overruns the BCR32's SysEx input.
+// edits) never overruns the BCR32's SysEx input. The baseline is what the controller plays: the
+// image as it last loaded it (store.live), not what a Send wrote into its RAM since.
 let syncing = false;
 let syncAgain = false;
 async function syncEdits() {
@@ -174,7 +175,7 @@ async function syncEdits() {
       for (let cell = 0; cell < M.CELLS; cell++) {
         const rec = M.readRecord(img(), p, cell);
         const key = toHex(rec);
-        const have = S.sent.get(cell) ?? toHex(M.readRecord(S.store.dev, p, cell));
+        const have = S.sent.get(cell) ?? toHex(M.readRecord(S.store.live ?? S.store.dev, p, cell));
         if (key === have) continue;
         S.sent.set(cell, key);
         c.dev.edit(p, cell, rec).catch(() => {});
@@ -188,6 +189,24 @@ async function syncEdits() {
   } finally {
     syncing = false;
   }
+}
+
+// The page in view plays the editor's cells only until it loads again, and a SELECT of the page
+// in view doesn't load it again (0.24): before the link goes, or when Play edits is switched off,
+// the records the controller holds go back by EDIT, cell by cell, so nothing unsent keeps playing.
+async function dropLiveEdits(c = S.conn) {
+  if (!c?.info || !S.devState || !S.store.dev || !S.sent.size) return;
+  const p = S.devState.page;
+  const base = S.store.live ?? S.store.dev;
+  let n = 0;
+  for (const [cell, hex] of S.sent) {
+    const rec = M.readRecord(base, p, cell);
+    if (toHex(rec) === hex) continue;
+    c.dev.edit(p, cell, rec).catch(() => {});
+    if (++n % 8 === 0) await c.dev.getState().catch(() => {});
+  }
+  S.sent.clear();
+  if (n) await c.dev.getState().catch(() => {}); // the EDITs are in before anything after them
 }
 
 // ------------------------------------------------------------------ the demo BCR32
@@ -271,7 +290,8 @@ async function connect() {
     S.devState = await dev.getState();
     await dev.touchEvents(true);
     const data = await job('Reading', (j) => dev.readAll((k, n) => ((j.done = k), (j.total = n), progress())));
-    const kept = S.store.fromDevice(data);
+    S.store.forgetDevice(); // a fresh link: what its RAM and controller hold is read now
+    const kept = S.store.fromDevice(data); // and kept as "as connected" for the session
     S.history.clear(); // the image is the BCR32's now (plus your edits): undo starts here
     S.sent.clear();
     if (target === 'midi') S.prefs.lastPort = transport.name;
@@ -294,7 +314,8 @@ async function disconnect(force = false) {
   if (S.job) S.job.cancelled = true;
   if (!force && conn.info) {
     try {
-      await Promise.race([conn.dev.touchEvents(false), sleep(500)]);
+      // the unit stops playing the unsent edits, then touch events go off
+      await Promise.race([dropLiveEdits(conn).then(() => conn.dev.touchEvents(false)), sleep(1500)]);
     } catch {}
   }
   conn.dev.close();
@@ -318,9 +339,13 @@ function onDeviceState(e) {
   renderAll();
 }
 
+// Something is being typed or picked: Follow leaves the selection alone, so the keystrokes
+// can't land in another page's name box (the page name sits in #main, not the inspector).
 function typing() {
   const a = document.activeElement;
-  return !!a && $('#inspector').contains(a) && (a.tagName === 'INPUT' || a.tagName === 'SELECT');
+  if (!a) return false;
+  if (a.tagName === 'SELECT' || a.tagName === 'TEXTAREA') return true;
+  return a.tagName === 'INPUT' && !['checkbox', 'radio', 'button', 'file', 'range', 'submit'].includes(a.type);
 }
 
 function onDeviceTouch(e) {
@@ -345,12 +370,14 @@ async function send() {
   return job('Sending', async (j) => {
     const st = S.store;
     const chunks = st.deviceChunks();
-    if (!chunks.length) return say('Nothing to send: the BCR32 has it all.', 'ok');
+    if (!chunks.length && !st.deviceDirtyBytes()) return say('Nothing to send: the BCR32 has it all.', 'ok');
     const what = changeSummary();
     j.total = chunks.length;
     const t0 = performance.now();
-    // Written into the BCR32's RAM first; only RELOAD makes it use and keep them. Until RELOAD
-    // answers, nothing counts as sent: Cancel or an error stores nothing, and Send tries again.
+    // Written into the BCR32's RAM first (st.written); only RELOAD makes it use and keep them.
+    // Until RELOAD answers 21, nothing counts as stored: a Cancel or an error leaves the written
+    // bytes to send (and a Read meanwhile keeps the stored bytes as their baseline), and the next
+    // Send writes what the RAM doesn't hold yet, or just RELOADs.
     for (const c of chunks) {
       if (j.cancelled) throw new Error('Send cancelled: nothing stored.');
       if (!S.conn) throw new Error('BCR32 disconnected: nothing stored.');
@@ -360,6 +387,7 @@ async function send() {
         logLine('!', null, e.message);
         throw new Error(j.cancelled ? 'Send cancelled: nothing stored.' : 'Send stopped: nothing stored. Send again.');
       }
+      st.written(c.addr, c.data);
       j.done++;
       progress();
     }
@@ -368,9 +396,16 @@ async function send() {
       S.devState = await S.conn.dev.reload();
     } catch (e) {
       logLine('!', null, e.message);
+      if (e.code === ERR_STORE) {
+        // 7F 24 04: the BCR32 plays the image now, but could not keep it (no store, a flash
+        // error): not stored, so it stays to send
+        st.reloadedUnkept();
+        S.sent.clear();
+        throw new Error(`Sent ${what}, but the BCR32 could not store it (no store, or a flash error). It plays it until power-off. Still to send.`);
+      }
       throw new Error('No reply while storing. Send again.');
     }
-    st.committed(chunks);
+    st.committed();
     S.sent.clear(); // RELOAD drops the RAM edits; the image has them now
     syncEdits();
     say(`Sent ${what} (${((performance.now() - t0) / 1000).toFixed(1)} s). Stored.`, 'ok');
@@ -393,6 +428,14 @@ function discard() {
   const base = S.store.dev ?? S.store.file;
   if (!base) return;
   if (edit(() => img().set(base), { label: 'discard', header: false })) say(`Back to ${S.store.dev ? 'the BCR32' : S.store.fileName}. ⌘Z brings the edits back.`);
+}
+
+// The image the BCR32 had when the session connected, as an edit (so it goes back to the unit
+// with Send, and ⌘Z undoes it): a Send is reversible even once the history is gone.
+function asConnected() {
+  const c = S.store.connected;
+  if (!c) return;
+  if (edit(() => img().set(c), { label: 'as connected', header: false })) say(`Back to the image the BCR32 had when you connected: ${changeSummary() || 'nothing'} to send. ⌘Z brings the edits back.`);
 }
 
 // ------------------------------------------------------------------ files
@@ -621,6 +664,8 @@ function renderToolbar() {
   $('#undo').disabled = !S.history.canUndo;
   $('#redo').disabled = !S.history.canRedo;
   $('#discard').disabled = busy || !(S.store.dev ?? S.store.file) || !(S.store.dev ? n : S.store.unsaved());
+  $('#asconnected').disabled = busy || !S.store.connected || !differs(img(), S.store.connected);
+  $('#asconnected').hidden = !S.store.connected;
   $('#save').disabled = busy || !S.store.loaded;
   $('#import').classList.toggle('on', S.view === 'import');
   document.body.classList.toggle('connected', !!info);
@@ -679,8 +724,9 @@ function pageBar() {
       h('span', { class: 'lbl' }, 'Out'), outputs,
       h('span', { class: 'sync' + (hd.valid ? ' on' : ''), title: hd.valid ? `header ${toHex(hd.bytes)}` : '' }, sync),
       hd.valid || n ? h('button', { class: 'small', title: 'Remove the FH-2 sync from every page (undoable)', onclick: removeAllSync }, 'Remove FH-2 (all pages)') : null,
-      // SELECT loads the page again on the BCR32, which drops the played edits: send them again
-      S.conn?.info ? h('button', { class: 'small', title: 'Show this page on the BCR32', onclick: () => S.conn.dev.select(p).then(() => (S.sent.clear(), syncEdits())).catch(showError) }, 'Show on BCR32') : null));
+      // a page change loads the page on the BCR32, which drops the played edits: its STATE
+      // (onDeviceState) sends them again; the page already in view stays as it is
+      S.conn?.info ? h('button', { class: 'small', title: 'Show this page on the BCR32', onclick: () => S.conn.dev.select(p).catch(showError) }, 'Show on BCR32') : null));
 }
 
 function selectPage(q) {
@@ -794,7 +840,7 @@ function numField(key, value, min, max, onCommit, disabled) {
 
 function selectField(key, options, value, onCommit, disabled) {
   return h('select', { dataset: { key }, disabled, onchange: (ev) => ev.target.value !== '' && onCommit(Number(ev.target.value)) },
-    options.map((o) => h('option', { value: String(o.value), selected: o.value === value }, o.label)));
+    options.map((o) => h('option', { value: String(o.value), selected: o.value === value, disabled: !!o.disabled }, o.label)));
 }
 
 function row(label, control, { enabled = true, hint, note } = {}) {
@@ -876,9 +922,11 @@ function pushFields(p, c, pu) {
   const key = M.isKey(c);
   const set = (field) => (v) => edit(() => M.setPush(img(), p, c, field, v), { label: `${M.cellLabel(c)} push ${field}` });
   const out = [];
-  // Keys have no encoder: the encoder's push types aren't offered there (kept if stored).
-  const types = M.PUSH_TYPES.map((t, v) => ({ value: v, label: t.label })).filter((o) => !key || o.value < M.PT.ACC0 || o.value === pu.type);
+  // A key has no encoder: Set and the encoder's push types are greyed out for it, and one that
+  // is stored all the same shows what the BCR32 makes of it (off).
+  const types = M.PUSH_TYPES.map((t, v) => ({ value: v, label: t.label, disabled: key && !M.pushTypeOnKey(v) && v !== pu.type }));
   out.push(row('Type', selectField('ptype', types, pu.type, set('type'))));
+  if (pu.onKeyOff) out.push(h('div', { class: 'warn' }, `${M.PUSH_TYPES[pu.type].short} needs an encoder: on a key the BCR32 plays it as off.`));
   if (pu.off) return out;
   const pageOpts = r.channel.kind === 'page';
   out.push(row(r.channel.label, selectField('pchannel', pageOpts ? channelOptions('Page ', 4) : channelOptions(), pageOpts ? pu.channel & 3 : pu.channel, set('channel'), !r.channel.enabled), { enabled: r.channel.enabled }));
@@ -981,7 +1029,7 @@ function renderStatus() {
       h('span', { class: 'pend' + (n && S.conn ? ' has' : '') }, pend),
       ds ? h('span', { class: 'devstate', title: 'what the BCR32 shows' }, ds.mode === 1 ? `BCR32: page ${ds.page + 1}` : 'BCR32: sequencer') : null,
       toggle('follow', 'Follow', 'Touching a knob or key, or a page change on the BCR32, selects it here'),
-      toggle('liveEdit', 'Play edits', 'The BCR32 plays your edits of the page it shows before Send (EDIT, RAM only)', () => syncEdits()),
+      toggle('liveEdit', 'Play edits', 'The BCR32 plays your edits of the page it shows before Send (EDIT, RAM only); off, it plays its stored cells again', () => (S.prefs.liveEdit ? syncEdits() : dropLiveEdits())),
       toggle('showLog', 'Log', 'Show the protocol log', () => renderLog()),
       $('#target').value === 'mock' ? toggle('showMock', 'Demo panel', 'Show the demo BCR32', () => renderMock()) : null));
 }
@@ -1071,6 +1119,7 @@ function renderMock() {
         } }), 'USB timing'),
         h('div', { class: 'faults' }, h('span', { class: 'hint' }, 'Faults: '),
           fault('writes fail', m.faults.writeStatus !== 0, (v) => (m.faults.writeStatus = v ? 1 : 0)),
+          fault('store fails', m.faults.reloadStatus !== 0, (v) => (m.faults.reloadStatus = v ? ERR_STORE : 0)),
           fault('drop next reply', m.faults.dropReplies > 0, (v) => (m.faults.dropReplies = v ? 1 : 0)),
           fault('corrupt next READ', m.faults.badChecksum, (v) => (m.faults.badChecksum = v))),
         h('div', { class: 'hint' }, `${m.stats.reads} reads · ${m.stats.writes} writes · ${m.stats.reloads} reloads · ${m.stats.edits} edits`),
@@ -1122,6 +1171,7 @@ function init() {
   $('#send').onclick = () => send().catch(showError);
   $('#reread').onclick = () => reread();
   $('#discard').onclick = () => discard();
+  $('#asconnected').onclick = () => asConnected();
   $('#open').onclick = () => $('#fileinput').click();
   $('#save').onclick = () => save();
   $('#import').onclick = () => (S.view === 'import' ? ((S.view = 'pages'), renderAll()) : openImport());

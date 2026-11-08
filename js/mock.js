@@ -1,7 +1,9 @@
 // A mock BCR32 running Rotary Club's controller protocol (docs/controller-protocol.md) on an
 // in-memory 4 KB image: the demo and test target, after Lilypad's mock.js. WRITE changes the
-// image in RAM; RELOAD makes the controller use it and keeps it (the "store"). One request at a
-// time: a request that arrives while one is being handled is answered 7F cmd 03 (busy).
+// image in RAM; RELOAD makes the controller use it and keeps it (the "store"), or answers
+// 7F 24 04 when the store fails (the fault "store fails"): in use, not kept. SELECT of the page
+// in view changes nothing (0.24: its EDITs stay). One request at a time: a request that arrives
+// while one is being handled is answered 7F cmd 03 (busy).
 
 import { CMD, SPACE, MAX_CHUNK, WRITE_STATUS, device as reply, decodeCommand } from './proto.js';
 import * as M from './model.js';
@@ -25,7 +27,7 @@ export class MockBcr32 {
     this.texts = [new Map(), new Map()]; // labels, value texts: cell -> 4 characters
     this.lastTouch = new Map();
     this.syncOff = false; // any controller command switches the FH-2 sync off until USB goes down
-    this.faults = { writeStatus: 0, dropReplies: 0, badChecksum: false };
+    this.faults = { writeStatus: 0, dropReplies: 0, badChecksum: false, reloadStatus: 0 };
     this.stats = { reads: 0, writes: 0, bytesWritten: 0, reloads: 0, edits: 0, busy: 0, log: [] };
     this.listeners = new Set();
     this.port = null;
@@ -153,15 +155,21 @@ export class MockBcr32 {
         return this._reply(this._state());
       case CMD.SELECT:
         if (c.page > 3) return err(2);
-        this.page = c.page;
-        this._pageLoaded();
-        this._updated('state');
+        if (c.page !== this.page) { // the page in view stays as it is, its edits too
+          this.page = c.page;
+          this._pageLoaded();
+          this._updated('state');
+        }
         return this._reply(this._state());
       case CMD.RELOAD:
         this.live = Uint8Array.from(this.ram);
-        this.store = Uint8Array.from(this.ram);
         this.stats.reloads++;
         this._pageLoaded();
+        if (this.faults.reloadStatus) { // in use, but not kept
+          this._updated('ram');
+          return this._reply(reply.error(CMD.RELOAD, this.faults.reloadStatus), 20);
+        }
+        this.store = Uint8Array.from(this.ram);
         this._updated('store');
         return this._reply(this._state(), 20);
       case CMD.TOUCH_EVENTS:

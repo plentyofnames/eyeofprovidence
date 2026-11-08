@@ -241,14 +241,21 @@ export function decodeEncoder(r) {
   };
 }
 
-export function decodePush(r) {
+// A key has no encoder: Set and the encoder's push types (Acc0, Acc3, LSp6, Min, Max) are off
+// on it, as the firmware plays them (ctl.c).
+export const pushTypeOnKey = (t) => t !== PT.SET && t < PT.ACC0;
+
+export function decodePush(r, key = false) {
   const rawType = r[7] >> 4;
   const valid = rawType < PUSH_TYPES.length;
+  const type = valid ? rawType : PT.OFF;
+  const onKeyOff = key && !pushTypeOnKey(type);
   return {
-    type: valid ? rawType : PT.OFF,
+    type,
     rawType,
     valid,
-    off: !valid || rawType === PT.OFF,
+    onKeyOff,
+    off: !valid || type === PT.OFF || onKeyOff,
     channel: r[7] & 15,
     mode: r[12] >> 7, // 1 toggle, 0 key
     number: r[12] & 0x7F,
@@ -265,7 +272,7 @@ export function readCell(img, p, c) {
     rec,
     blank: isBlankRecord(rec),
     enc: decodeEncoder(rec),
-    push: decodePush(rec),
+    push: decodePush(rec, isKey(c)),
     name: readName(rec, 8).trimEnd(),
     blankName: isBlankName(rec, 8),
   };
@@ -358,8 +365,10 @@ function setLowerUpper(r, which, v, hires) {
   }
 }
 
-// Defaults for a knob or key that is switched on from blank.
+// Defaults for a knob or key that is switched on from blank. A knob's push takes CC 64 + knob,
+// clear of the knob's own CC 20 + knob and of the 14-bit LSBs 33-63 (review, 2026-11-08).
 const DEFAULT_CC = (c) => (20 + c) & 0x7F;
+const DEFAULT_PUSH_CC = (c) => (64 + c) & 0x7F;
 const DEFAULT_NOTE = (c) => 36 + (c - KNOBS);
 const encoderBlank = (r) => [0, 1, 2, 3, 4, 5, 6].every((k) => r[k] === 0xFF);
 const pushBlank = (r) => r[12] === 0xFF && r[13] === 0xFF && r[14] === 0xFF && r[7] >> 4 > 12;
@@ -450,7 +459,7 @@ export function setPushRec(r, c, field, value) {
       const t = v >= 0 && v < PUSH_TYPES.length ? v : PT.OFF;
       if (t !== PT.OFF && pushBlank(r)) {
         r[7] = 0x00; // channel 1
-        r[12] = isKey(c) ? DEFAULT_NOTE(c) : DEFAULT_CC(c); // key mode
+        r[12] = isKey(c) ? DEFAULT_NOTE(c) : DEFAULT_PUSH_CC(c); // key mode
         r[13] = 0x80 | (t === PT.NOTE ? 64 : 0); // display on; a note's off velocity 64, a CC's off 0
         r[14] = 127; // no link, upper 127
       }

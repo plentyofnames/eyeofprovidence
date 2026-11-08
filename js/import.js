@@ -111,10 +111,23 @@ export function scanEc4(src) {
   return { groups, beyond, setupName, header, headerOk, format: header?.[3] };
 }
 
-// Maps the chosen EC4 groups onto `bcr` (the BCR32 image): their 16 cells each, the knobs'
-// sync entries (FF where the source has no tables), the header if the source has one, and the
-// page name from the left half's group (or the right one's when the left isn't imported).
-// Returns what changed: { cells: ['p:k'], pages: [p], header, names: {p: name} }.
+// Night Shift's free knobs (FH-2/js/ec4/setup.js, encoderOf and pushOf for a cell that maps
+// nothing): CC 119 relative on the pages channel, Acc0, display off, 0-127, a blank name, no
+// push and no sync entry, because the EC4 has no "off". The BCR32 has one: they become blank
+// cells (review, 2026-11-08). The link bits don't count: a group's last cell keeps them set.
+export const FREE_CC = 119;
+export function isFreeKnob(rec, synced) {
+  const e = M.decodeEncoder(rec);
+  const p = M.decodePush(rec);
+  return e.type === M.T.CCR1 && e.number === FREE_CC && e.mode === 3 && e.scale === 0 && e.lower === 0 && e.upper === 127
+    && !M.readName(rec, 8).trim() && p.off && !synced;
+}
+const ec4Synced = (src, g, i) => src.hasTables && (src.img[taAddr(g, i)] !== 0xFF || src.img[taAddr(g, i) + 1] !== 0xFF);
+
+// Maps the chosen EC4 groups onto `bcr` (the BCR32 image): their 16 cells each (a free knob as
+// a blank cell), the knobs' sync entries (FF where the source has no tables), the header if the
+// source has one, and the page name from the left half's group (or the right one's when the
+// left isn't imported). Returns what changed: { cells: ['p:k'], pages: [p], header, names: {p: name} }.
 export function applyImport(bcr, src, groups) {
   const { img } = src;
   const s = EC4_SETUP;
@@ -125,7 +138,14 @@ export function applyImport(bcr, src, groups) {
     const p = bcrPage(g);
     for (let i = 0; i < 16; i++) {
       const k = bcrKnob(g, i);
-      M.writeRecord(bcr, p, k, ec4CellRecord(img, s, g, i));
+      const rec = ec4CellRecord(img, s, g, i);
+      if (isFreeKnob(rec, ec4Synced(src, g, i))) {
+        M.clearCell(bcr, p, k);
+        M.removeSync(bcr, p, k);
+        done.cells.push(`${p}:${k}`);
+        continue;
+      }
+      M.writeRecord(bcr, p, k, rec);
       if (src.hasTables) {
         bcr.set(img.slice(taAddr(g, i), taAddr(g, i) + 2), M.syncAAddr(p, k));
         bcr.set(img.slice(tbAddr(g, i), tbAddr(g, i) + 2), M.syncBAddr(p, k));

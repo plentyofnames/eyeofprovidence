@@ -209,6 +209,22 @@ test('clamps: types 9-15 off, modes > 9 Acc2, push types > 12 off', () => {
   }
 });
 
+test('a key\'s push of type Set, Acc0, Acc3, LSp6, Min or Max is off (a key has no encoder)', () => {
+  const img = M.blankImage();
+  for (const t of [M.PT.SET, M.PT.ACC0, M.PT.ACC3, M.PT.LSP6, M.PT.MIN, M.PT.MAX]) {
+    const r = M.blankImage().slice(0, 15);
+    r[7] = t << 4;
+    r[12] = 0;
+    assert(!M.decodePush(r, false).off, `type ${t} on a knob's push plays`);
+    const p = M.decodePush(r, true);
+    assert(p.off && p.onKeyOff && p.type === t, `type ${t} on a key is off, the type kept`);
+    M.writeRecord(img, 0, M.keyCell(1), r);
+    assert(M.readCell(img, 0, M.keyCell(1)).push.off && !M.pushTypeOnKey(t), `readCell of key 2 says off (${t})`);
+    eq(M.pushSummary(M.readCell(img, 0, M.keyCell(1)).push), 'off');
+  }
+  for (const t of [M.PT.NOTE, M.PT.CC, M.PT.PRGC, M.PT.PBND, M.PT.AFTT, M.PT.GRP]) assert(M.pushTypeOnKey(t), `type ${t} is a key's`);
+});
+
 test('switching 7/14 bits rescales the range; CCAh numbers 0-31', () => {
   const img = M.blankImage();
   M.setEncoder(img, 0, 3, 'type', M.T.CCAB);
@@ -240,6 +256,7 @@ test('keys: push defaults, link not on the last knob or key, Grp pages 1-4', () 
   M.setEncoder(img, 0, 31, 'link', 1);
   eq(M.readCell(img, 0, 31).enc.link, 0, 'knob 32 no link');
   M.setPush(img, 0, 5, 'type', M.PT.CC);
+  eq(M.readCell(img, 0, 5).push.number, 69, 'a knob\'s push: CC 64 + knob, clear of its own CC 25 and the 14-bit LSBs');
   M.setPush(img, 0, 5, 'channel', 9);
   M.setPush(img, 0, 5, 'type', M.PT.GRP);
   eq(M.readCell(img, 0, 5).push.channel, 0, 'Grp channel back to page 1');
@@ -332,18 +349,64 @@ test('EC4 cell record matches controlfrog\'s layout', () => {
   eqBytes(I.ec4CellRecord(img, s, g, i), [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x41, 0x42, 0x43, 0x44, 0x8C, 0x85, 0x7F]);
 });
 
+// A Night Shift free knob in the EC4 image (CC 119 relative, no name, no push, no entry).
+function freeInEc4(ec4, g, i, tables) {
+  const synced = tables && (ec4[0x0600 + 32 * g + 2 * i] !== 0xFF || ec4[0x0601 + 32 * g + 2 * i] !== 0xFF);
+  return I.isFreeKnob(I.ec4CellRecord(ec4, 14, g, i), synced);
+}
+
 function checkImport(bcr, ec4, groups, { tables = true, tableC = true } = {}) {
+  let free = 0;
   for (const g of groups) {
     const p = I.bcrPage(g);
     for (let i = 0; i < 16; i++) {
       const k = I.bcrKnob(g, i);
+      if (freeInEc4(ec4, g, i, tables)) {
+        free++;
+        assert(M.readCell(bcr, p, k).blank && !M.readSync(bcr, p, k), `a free knob is a blank cell g${g} i${i}`);
+        continue;
+      }
       eqBytes(M.readRecord(bcr, p, k), I.ec4CellRecord(ec4, 14, g, i), `cell g${g} i${i}`);
       const want = tables ? [ec4[0x0600 + 32 * g + 2 * i], ec4[0x0601 + 32 * g + 2 * i], ec4[0x0200 + 32 * g + 2 * i], ec4[0x0201 + 32 * g + 2 * i], tableC ? ec4[0x0400 + 16 * g + i] : 0xFF]
         : [0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
       eqBytes([bcr[M.syncAAddr(p, k)], bcr[M.syncAAddr(p, k) + 1], bcr[M.syncBAddr(p, k)], bcr[M.syncBAddr(p, k) + 1], bcr[M.syncCAddr(p, k)]], want, `sync g${g} i${i}`);
     }
   }
+  return free;
 }
+
+test('import: Night Shift\'s free knobs (CC 119 relative, nameless, no push) become blank cells', () => {
+  const ec4 = fakeNightShiftEc4();
+  const bcr = M.blankImage();
+  I.applyImport(bcr, { img: ec4, hasTables: true, hasTableC: true }, [0, 1, 2]);
+  const free = checkImport(bcr, ec4, [0, 1, 2]);
+  eq(free, 48 - 10 - 8 - 5, 'the three pages\' 25 free knobs');
+  let blank = 0;
+  let rel119 = 0;
+  for (let p = 0; p < 2; p++) for (let k = 0; k < 32; k++) {
+    const c = M.readCell(bcr, p, k);
+    if (c.blank) blank++;
+    if (!c.enc.off && c.enc.type === M.T.CCR1 && c.enc.number === 119) rel119++;
+  }
+  eq(rel119, 0, 'no knob sends CC 119');
+  eq(blank, 25 + 16, 'on pages 1 and 2: the 25 free knobs and page 2\'s right half are blank');
+  // a free knob that has a sync entry, a name or a push is not free
+  const r = I.ec4CellRecord(ec4, 14, 1, 15); // group 2's cell 16: free
+  assert(I.isFreeKnob(r, false), 'group 2 cell 16 is free');
+  assert(!I.isFreeKnob(r, true), 'with an entry it isn\'t');
+  const named = Uint8Array.from(r);
+  named.set([0x41, 0x42, 0x43, 0x44], 8);
+  assert(!I.isFreeKnob(named, false), 'with a name it isn\'t');
+  const pushed = Uint8Array.from(r);
+  pushed[7] = (M.PT.CC << 4) | 0;
+  assert(!I.isFreeKnob(pushed, false), 'with a push it isn\'t');
+  // the demo image, built by the import: no CC 119 knobs either
+  const demo = demoImage();
+  for (let p = 0; p < 4; p++) for (let k = 0; k < 32; k++) {
+    const e = M.readCell(demo, p, k).enc;
+    assert(e.off || e.number !== 119 || e.type !== M.T.CCR1, `demo ${p}:${k}`);
+  }
+});
 
 test('import: cells and tables A, B, C go with their knobs; the rest stays', () => {
   const ec4 = fakeNightShiftEc4();
@@ -486,14 +549,44 @@ test('send: WRITE the changed ranges, RELOAD keeps them', async () => {
     await dev.write(c.addr, c.data);
     store.written(c.addr, c.data);
   }
-  eq(store.deviceDirtyBytes(), 0, 'nothing left');
+  eq(store.deviceChunks().length, 0, 'nothing left to write');
+  assert(store.deviceDirtyBytes() > 0, 'but not stored yet');
   assert(M.readCell(mock.live, 3, 10).blank, 'not live before RELOAD');
   const st = await dev.reload();
   eq(st.mode, 1);
+  store.committed();
+  eq(store.deviceDirtyBytes(), 0, 'stored');
   eqBytes(mock.store, store.img, 'stored');
   eqBytes(mock.live, store.img, 'live');
   eq(mock.stats.writes, chunks.length);
   eq(M.readCell(mock.live, 3, 10).name, 'NEW');
+  dev.close();
+});
+
+test('a RELOAD the BCR32 could not store answers 7F 24 04: live, not kept, still to send', async () => {
+  const mock = new MockBcr32(demoImage(), { speed: 'fast' });
+  const dev = connect(mock);
+  await dev.identify();
+  const store = new Store();
+  store.fromDevice(await dev.readAll());
+  M.setName(store.img, 1, 2, 'LIVE');
+  mock.faults.reloadStatus = 4;
+  for (const c of store.deviceChunks()) {
+    await dev.write(c.addr, c.data);
+    store.written(c.addr, c.data);
+  }
+  const e = await throws(() => dev.reload(), /could not be stored/, 'RELOAD');
+  eq(e.code, 4, 'error code 4');
+  eq(M.cellName(mock.live, 1, 2), 'LIVE', 'the controller plays it');
+  assert(M.cellName(mock.store, 1, 2) !== 'LIVE', 'the store does not have it');
+  store.reloadedUnkept();
+  eq(M.cellName(store.live, 1, 2), 'LIVE', 'the editor knows what it plays');
+  assert(store.deviceDirtyBytes() > 0, 'and that it is still to send');
+  eq(store.deviceChunks().length, 0, 'nothing to write, only to store');
+  mock.faults.reloadStatus = 0;
+  await dev.reload();
+  store.committed();
+  eq(store.deviceDirtyBytes(), 0, 'stored at the second try');
   dev.close();
 });
 
@@ -565,7 +658,9 @@ test('live link: TOUCH and STATE events, EDIT for the page in view', async () =>
   eq(mock.edits.size, 1);
   assert(errors.length === 2 && errors.every((e) => e.cmd === 0x2C && e.code === 1), 'other page and bad cell: 7F 2C 01');
   await dev.select(2);
-  eq(mock.edits.size, 0, 'SELECT drops the edits');
+  eq(mock.edits.size, 1, 'SELECT of the page in view changes nothing: the edit stays');
+  await dev.select(1);
+  eq(mock.edits.size, 0, 'another page drops the edits');
   dev.close();
 });
 
@@ -622,17 +717,58 @@ test('store: an opened file is kept whole; Send commits only after it is stored'
   eqBytes(st.img, file, 'the file survives the connect');
   const chunks = st.deviceChunks();
   assert(chunks.length > 0, 'all of it to send');
-  st.committed(chunks.slice(0, 1)); // say only part was stored (as if RELOAD answered for that)
+  for (const c of chunks) st.written(c.addr, c.data);
+  st.committed(); // RELOAD answered
   eq(st.touched.size, 0, 'nothing is the editor\'s own after a stored Send');
   const st3 = new Store();
   st3.fromDevice(dev);
   const h3 = new History(st3.img);
   edited(st3, h3, () => M.setName(st3.img, 0, 0, 'XYZ '));
   const c3 = st3.deviceChunks();
-  // a Send whose RELOAD failed commits nothing: still to send
+  for (const c of c3) st3.written(c.addr, c.data);
+  // a Send whose RELOAD failed commits nothing: still to send, though nothing is left to write
   eq(st3.deviceDirtyBytes() > 0, true, 'pending until RELOAD answers');
-  st3.committed(c3);
+  eq(st3.deviceChunks().length, 0, 'the RAM has it');
+  st3.committed();
   eq(st3.deviceDirtyBytes(), 0, 'stored');
+});
+
+test('store: a Send that failed after a WRITE: the next Read keeps the stored bytes as the baseline', () => {
+  const st = new Store();
+  const h = new History(st.img);
+  const unit = demoImage(); // the BCR32's store and RAM
+  st.fromDevice(unit);
+  edited(st, h, () => M.setName(st.img, 0, 0, 'MINE'));
+  edited(st, h, () => M.setName(st.img, 2, 3, 'LATE'));
+  const chunks = st.deviceChunks();
+  eq(chunks.length, 2, 'two ranges');
+  // the first WRITE answered, then the Send stopped (a timeout, a disconnect): the BCR32's RAM
+  // holds it, its store doesn't
+  const ram = Uint8Array.from(unit);
+  ram.set(chunks[0].data, chunks[0].addr);
+  st.written(chunks[0].addr, chunks[0].data);
+  eq(st.unkeptBytes() > 0, true, 'written, not kept');
+  // Read: the unit's RAM comes back with the written bytes
+  const kept = st.fromDevice(ram);
+  eq(M.cellName(st.img, 0, 0), 'MINE', 'the written name is in the image');
+  eq(M.cellName(st.img, 2, 3), 'LATE', 'the unwritten edit is kept as an edit');
+  eq(kept > 0, true, 'something kept');
+  eq(M.cellName(st.dev, 0, 0), M.cellName(unit, 0, 0), 'the stored name is still the baseline');
+  assert(st.deviceDirtyBytes() > 0 && st.isDeviceDirty(M.cellAddr(0, 0) + 8), 'the written name is still to send');
+  const again = st.deviceChunks();
+  eq(again.length, 1, 'only the unwritten range is left to write');
+  eq(again[0].addr, chunks[1].addr);
+  // Discard: back to the store's bytes; the RAM now differs from the image, so a Send writes
+  // the stored bytes back before it RELOADs
+  st.revertToDevice();
+  eq(st.deviceDirtyBytes(), 0, 'nothing to store after a discard');
+  eq(st.deviceChunks().length, 1, 'but the written range goes back to what the store holds');
+  eq(st.deviceChunks()[0].addr, chunks[0].addr);
+  // and once a RELOAD answers, everything is kept
+  for (const c of st.deviceChunks()) st.written(c.addr, c.data);
+  st.committed();
+  eq(st.unkeptBytes(), 0, 'kept');
+  eqBytes(st.dev, st.ram, 'store and RAM agree');
 });
 
 test('defaults: a blank knob switched to 14-bit gets the whole range; a note key its note off', () => {
