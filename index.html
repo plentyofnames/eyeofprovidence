@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Eye of Providence</title>
+  <meta name="description" content="Browser editor for the controller pages of Rotary Club, a custom firmware for the Behringer BCR32. Not affiliated with Behringer.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 2L28.12 23L3.88 9L16 30L28.12 9L3.88 23Z' fill='none' stroke='%23f2a93b' stroke-width='2.4' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand"><svg class="mark" width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><path d="M16 2L28.12 23L3.88 9L16 30L28.12 9L3.88 23Z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/><circle cx="16" cy="16" r="2.2" fill="currentColor"/></svg>Eye of Providence<span>BCR32 pages · Rotary Club</span></div>
+    <div class="group conn">
+      <select id="target" title="Where to connect">
+        <option value="mock" selected>Demo BCR32</option>
+        <option value="midi">BCR32 (MIDI)</option>
+      </select>
+      <select id="midiport" hidden title="MIDI port"></select>
+      <button id="connect">Connect</button>
+      <span id="devinfo" class="chip">offline</span>
+    </div>
+    <div class="group dev">
+      <button id="send" class="primary" title="Write the changed bytes, then RELOAD">Send</button>
+      <button id="reread" title="Read the BCR32 again (your edits stay)">Read</button>
+    </div>
+    <div class="group file">
+      <button id="undo" class="icon" title="Undo (⌘Z)" aria-label="Undo">↶</button>
+      <button id="redo" class="icon" title="Redo (⇧⌘Z)" aria-label="Redo">↷</button>
+      <button id="discard" title="Back to what the BCR32 holds (undoable)">Discard</button>
+      <button id="open" title="Open a 4 KB .bin backup (or drop it on the page)">Open</button>
+      <button id="save" title="Save the 4 KB image as .bin">Save</button>
+      <button id="import" title="Night Shift's FH-2 pages from an EC4">Import</button>
+    </div>
+    <input type="file" id="fileinput" accept=".bin,.BIN,.syx,.SYX" hidden>
+    <input type="file" id="syxinput" accept=".syx,.SYX" hidden>
+  </header>
+
+  <div class="layout">
+    <main id="main"></main>
+    <aside id="inspector"></aside>
+  </div>
+
+  <section id="mockpanel" hidden aria-label="Demo BCR32"></section>
+  <pre id="log" hidden></pre>
+  <footer id="status"></footer>
+  <dialog id="dialog"></dialog>
+</body>
+</html>

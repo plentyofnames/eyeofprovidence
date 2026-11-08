@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Eye of Providence tests</title>
+  <style>
+    body { font: 13px/1.5 ui-monospace, Menlo, monospace; margin: 20px; background: #131518; color: #e4e6e9; }
+    .fail { color: #ff6b6b; } .ok { color: #4cc38a; }
+  </style>
+</head>
+<body>
+  <h3>Eye of Providence core tests</h3>
+  <pre id="out">running…</pre>
+  <script type="module">
+    import { runTests } from './core.test.js';
+    const out = document.getElementById('out');
+    out.textContent = '';
+    const load = async (path) => {
+      const r = await fetch('../' + path).catch(() => null);
+      return r?.ok ? new Uint8Array(await r.arrayBuffer()) : null;
+    };
+    const failed = await runTests(load, (line) => {
+      const span = document.createElement('span');
+      span.className = line.startsWith('FAIL') ? 'fail' : line.startsWith('ok') ? 'ok' : '';
+      span.textContent = line + '\n';
+      out.append(span);
+    });
+    document.title = failed ? `FAIL (${failed})` : 'all passed';
+  </script>
+</body>
+</html>
