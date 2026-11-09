@@ -13,6 +13,8 @@ import * as I from './import.js';
 import { Device as Ec4Device } from './ec4/device.js';
 import { MockDevice as MockEc4 } from './ec4/mock.js';
 import { h, $, replace, download } from './dom.js';
+import { LiveLink } from './live.js';
+import * as B from './bulk.js';
 
 const MOCK_KEY = 'eye-mock-store';
 const PREFS_KEY = 'eye-prefs';
@@ -21,7 +23,7 @@ const MIN_FW = [0, 23];
 
 const S = {
   store: new Store(),
-  sel: { page: 0, cell: 0 },
+  sel: { page: 0, cell: 0, multi: null }, // multi: a Set of cells when several are selected (bulk editing)
   view: 'pages', // 'pages' | 'import'
   conn: null, // {dev, kind, name, info}
   devState: null, // {mode, page} as the BCR32 last said
@@ -32,7 +34,7 @@ const S = {
   flash: null, // {page, cell, t}
   imported: null, // {cells: Set('p:c'), text}
   imp: { src: null, scan: null, chosen: new Set(), ports: [], busy: false },
-  sent: new Map(), // cell -> record (hex) sent with EDIT to the page in view
+  reading: false, // the connect's first read: the grid waits for it
   prefs: { follow: true, liveEdit: true, showLog: false, showMock: true, mockSpeed: 'usb', lastPort: '', ec4Port: '' },
 };
 
@@ -152,62 +154,11 @@ const isDirty = (addr) => (S.store.dev ? S.store.isDeviceDirty(addr) : S.store.f
 const cellDirty = (p, c) => M.cellAddrs(p, c).some(isDirty);
 const pageDirty = (p) => range(0, M.CELLS).some((c) => cellDirty(p, c)) || [M.pageNameAddr(p), M.pageNameAddr(p) + 1, M.pageNameAddr(p) + 2, M.pageNameAddr(p) + 3, M.A.OUTPUTS + p].some(isDirty);
 
-// ---- live edits: the page the BCR32 shows plays the editor's cells before Send (EDIT, RAM only)
+// ---- live edits: the page the BCR32 shows plays the editor's cells before Send (live.js)
 
-// Paced: 8 EDITs, then a GET_STATE round trip, so a burst (a page change, a connect that kept
-// edits) never overruns the BCR32's SysEx input. The baseline is what the controller plays: the
-// image as it last loaded it (store.live), not what a Send wrote into its RAM since.
-let syncing = false;
-let syncAgain = false;
-async function syncEdits() {
-  if (syncing) {
-    syncAgain = true;
-    return;
-  }
-  syncing = true;
-  try {
-    do {
-      syncAgain = false;
-      const c = S.conn;
-      if (!c?.info || !S.prefs.liveEdit || !S.devState || !S.store.dev) return;
-      const p = S.devState.page;
-      let n = 0;
-      for (let cell = 0; cell < M.CELLS; cell++) {
-        const rec = M.readRecord(img(), p, cell);
-        const key = toHex(rec);
-        const have = S.sent.get(cell) ?? toHex(M.readRecord(S.store.live ?? S.store.dev, p, cell));
-        if (key === have) continue;
-        S.sent.set(cell, key);
-        c.dev.edit(p, cell, rec).catch(() => {});
-        if (++n % 8 === 0) await c.dev.getState().catch(() => {});
-        if (S.conn !== c || S.devState?.page !== p) {
-          syncAgain = true; // the page changed meanwhile: start over on the new one
-          break;
-        }
-      }
-    } while (syncAgain);
-  } finally {
-    syncing = false;
-  }
-}
-
-// The page in view plays the editor's cells only until it loads again, and a SELECT of the page
-// in view doesn't load it again (0.24): before the link goes, or when Play edits is switched off,
-// the records the controller holds go back by EDIT, cell by cell, so nothing unsent keeps playing.
-async function dropLiveEdits(c = S.conn) {
-  if (!c?.info || !S.devState || !S.store.dev || !S.sent.size) return;
-  const p = S.devState.page;
-  const base = S.store.live ?? S.store.dev;
-  let n = 0;
-  for (const [cell, hex] of S.sent) {
-    const rec = M.readRecord(base, p, cell);
-    if (toHex(rec) === hex) continue;
-    c.dev.edit(p, cell, rec).catch(() => {});
-    if (++n % 8 === 0) await c.dev.getState().catch(() => {});
-  }
-  S.sent.clear();
-  if (n) await c.dev.getState().catch(() => {}); // the EDITs are in before anything after them
-}
+const live = new LiveLink(() => ({ conn: S.conn, devState: S.devState, liveEdit: S.prefs.liveEdit, store: S.store }));
+const syncEdits = () => live.sync();
+const dropLiveEdits = (c) => live.drop(c);
 
 // ------------------------------------------------------------------ the demo BCR32
 
@@ -272,6 +223,11 @@ async function connect() {
   }
   const dev = new Device(transport, { log: logLine });
   S.conn = { dev, kind: target, name: transport.name, info: null };
+  transport.ondisconnect = () => {
+    if (S.conn?.dev !== dev) return;
+    disconnect(true); // unplugged: noticed now, not at the next Send (review)
+    say(`${transport.name} went away. Unsent edits stay here.`, 'error');
+  };
   dev.addEventListener('state', onDeviceState);
   dev.addEventListener('touch', onDeviceTouch);
   // An EDIT can cross a page change on the BCR32: the new page's STATE resends it. Rotary Club
@@ -297,11 +253,17 @@ async function connect() {
     S.conn.info = info;
     S.devState = await dev.getState();
     await dev.touchEvents(true);
-    const data = await job('Reading', (j) => dev.readAll((k, n) => ((j.done = k), (j.total = n), progress())));
+    S.reading = true;
+    let data;
+    try {
+      data = await job('Reading', (j) => dev.readAll((k, n) => ((j.done = k), (j.total = n), progress())));
+    } finally {
+      S.reading = false;
+    }
     S.store.forgetDevice(); // a fresh link: what its RAM and controller hold is read now
     const kept = S.store.fromDevice(data); // and kept as "as connected" for the session
     S.history.clear(); // the image is the BCR32's now (plus your edits): undo starts here
-    S.sent.clear();
+    live.reset();
     if (target === 'midi') S.prefs.lastPort = transport.name;
     savePrefs();
     if (S.devState.mode === 1 && S.view === 'pages') S.sel.page = S.devState.page;
@@ -329,7 +291,7 @@ async function disconnect(force = false) {
   conn.dev.close();
   S.conn = null;
   S.devState = null;
-  S.sent.clear();
+  live.reset();
   renderAll();
   if (!force) say(S.store.deviceDirtyBytes() ? 'Disconnected. Unsent edits stay here.' : 'Disconnected.');
 }
@@ -340,10 +302,13 @@ function onDeviceState(e) {
   S.devState = { mode, page };
   // A page loaded on the BCR32 drops the RAM edits: send them again.
   if (moved || !solicited) {
-    S.sent.clear();
+    live.reset();
     syncEdits();
   }
-  if (!solicited && S.prefs.follow && mode === 1 && S.view === 'pages' && page < M.PAGES && !typing()) S.sel.page = page;
+  if (!solicited && S.prefs.follow && mode === 1 && S.view === 'pages' && page < M.PAGES && !typing() && page !== S.sel.page) {
+    S.sel.page = page;
+    S.sel.multi = null;
+  }
   renderAll();
 }
 
@@ -400,21 +365,32 @@ async function send() {
       progress();
     }
     j.label = 'Storing';
+    const dev = S.conn.dev;
+    let unkept = false;
+    const late = (e) => e.detail.cmd === 0x24 && e.detail.code === ERR_STORE && (unkept = true);
+    dev.addEventListener('deviceerror', late);
     try {
-      S.devState = await S.conn.dev.reload();
+      S.devState = await dev.reload();
+      // A page change on the unit (a T key) sends a STATE that can answer RELOAD before its own
+      // reply does. One GET_STATE more comes back only after RELOAD's real outcome, so a late
+      // 7F 24 04 is seen here, not after "Stored" (review, 2026-11-08)
+      S.devState = await dev.getState().catch(() => S.devState);
     } catch (e) {
       logLine('!', null, e.message);
-      if (e.code === ERR_STORE) {
-        // 7F 24 04: the BCR32 plays the image now, but could not keep it (no store, a flash
-        // error): not stored, so it stays to send
-        st.reloadedUnkept();
-        S.sent.clear();
-        throw new Error(`Sent ${what}, but the BCR32 could not store it (no store, or a flash error). It plays it until power-off. Still to send.`);
-      }
-      throw new Error('No reply while storing. Send again.');
+      if (e.code === ERR_STORE) unkept = true;
+      else throw new Error('No reply while storing. Send again.');
+    } finally {
+      dev.removeEventListener('deviceerror', late);
+    }
+    if (unkept) {
+      // 7F 24 04: the BCR32 plays the image now, but could not keep it (no store, a flash
+      // error): not stored, so it stays to send
+      st.reloadedUnkept();
+      live.reset();
+      throw new Error(`Sent ${what}, but the BCR32 could not store it (no store, or a flash error). It plays it until power-off. Still to send.`);
     }
     st.committed();
-    S.sent.clear(); // RELOAD drops the RAM edits; the image has them now
+    live.reset(); // RELOAD drops the RAM edits; the image has them now
     syncEdits();
     say(`Sent ${what} (${((performance.now() - t0) / 1000).toFixed(1)} s). Stored.`, 'ok');
   });
@@ -426,7 +402,7 @@ async function reread() {
     const data = await S.conn.dev.readAll((k, n) => ((j.done = k), (j.total = n), progress()));
     const kept = S.store.fromDevice(data);
     S.history.clear();
-    S.sent.clear();
+    live.reset();
     syncEdits();
     say(kept ? `Read. Your edits stay: ${changeSummary()} to send.` : 'Read.', 'ok');
   }).catch(showError);
@@ -487,7 +463,8 @@ async function openFile(file) {
   if (data.length !== M.SIZE) return say(`${file.name}: ${data.length} bytes; a backup is 4096.`, 'error');
   edit(() => img().set(data), { label: 'open ' + file.name });
   S.store.touchAll(); // the whole file is what you want, not only the bytes it changed here
-  S.store.file = Uint8Array.from(data);
+  // the file as opened, with the BCRC header a headerless one got: not "unsaved" from the start (review)
+  S.store.file = Uint8Array.from(img());
   S.store.fileName = file.name;
   S.store.loaded = true;
   S.view = 'pages';
@@ -595,19 +572,22 @@ function doImport() {
 
 // ------------------------------------------------------------------ copy / paste of a cell
 
+// {recs: [Uint8Array], from}: one cell or several (bulk.js), kept across tabs
 function getClip() {
   try {
     const c = JSON.parse(localStorage.getItem(CLIP_KEY) || 'null');
-    if (c?.eye === 1 && /^[0-9a-f]{30}$/.test(c.rec)) return { rec: fromHex(c.rec), from: c.from };
+    const hex = c?.eye === 1 ? (Array.isArray(c.recs) ? c.recs : c.rec ? [c.rec] : []) : [];
+    if (hex.length && hex.every((x) => /^[0-9a-f]{30}$/.test(x))) return { recs: hex.map(fromHex), from: c.from };
   } catch {}
   return S.clip || null;
 }
 function copyCell() {
-  const { page: p, cell: c } = S.sel;
-  const clip = { rec: M.readRecord(img(), p, c), from: `${M.cellLabel(c)}, page ${p + 1}` };
+  const p = S.sel.page;
+  const cells = selected();
+  const clip = { recs: B.copyCells(img(), p, cells), from: cells.length > 1 ? `${cells.length} cells, page ${p + 1}` : `${M.cellLabel(cells[0])}, page ${p + 1}` };
   S.clip = clip;
   try {
-    localStorage.setItem(CLIP_KEY, JSON.stringify({ eye: 1, rec: toHex(clip.rec), from: clip.from }));
+    localStorage.setItem(CLIP_KEY, JSON.stringify({ eye: 1, recs: clip.recs.map(toHex), from: clip.from }));
   } catch {}
   say(`Copied ${clip.from}.`, 'ok');
   renderInspector();
@@ -615,16 +595,10 @@ function copyCell() {
 function pasteCell() {
   const clip = getClip();
   if (!clip) return;
-  const { page: p, cell: c } = S.sel;
-  edit(() => {
-    const r = Uint8Array.from(clip.rec);
-    if (c === M.KNOBS - 1 || c === M.CELLS - 1) {
-      r[1] = r[1] === 0xFF ? 0xFF : r[1] & 0x7F; // no link on the last knob or key
-      r[14] = r[14] === 0xFF ? 0xFF : r[14] & 0x7F;
-    }
-    M.writeRecord(img(), p, c, r);
-  }, { label: 'paste' });
-  say(`Pasted ${clip.from} into ${M.cellLabel(c)}.`, 'ok');
+  const p = S.sel.page;
+  let done = [];
+  edit(() => (done = B.pasteCells(img(), p, selected(), clip.recs)), { label: 'paste' });
+  say(done.length > 1 ? `Pasted ${clip.from} into ${plural(done.length, 'cell')}.` : `Pasted ${clip.from} into ${M.cellLabel(done[0] ?? S.sel.cell)}.`, 'ok');
 }
 
 // ------------------------------------------------------------------ undo / redo
@@ -683,6 +657,7 @@ function renderMain() {
   const main = $('#main');
   if (S.view === 'import') return replace(main, importView());
   if (!S.store.loaded && !S.conn) return replace(main, welcome());
+  if (S.reading && !S.store.dev && !S.store.loaded) return replace(main, h('div', { class: 'reading' }, `Reading ${S.conn?.name ?? 'the BCR32'}…`));
   replace(main, pageBar(), h('div', { class: 'knobs', id: 'knobs' }, range(0, M.KNOBS).map((c) => cellBox(S.sel.page, c))),
     h('div', { class: 'keys-head' }, h('span', {}, 'Keys'), S.imported ? importedNote() : null),
     h('div', { class: 'keys', id: 'keys' }, range(0, M.KEYS).map((j) => cellBox(S.sel.page, M.keyCell(j)))));
@@ -723,7 +698,7 @@ function pageBar() {
     M.OUTPUTS.map((o) => h('button', { class: outs & o.bit ? 'on' : '', title: o.label, onclick: () => edit(() => M.toggleOutput(img(), p, o.bit), { label: `page ${p + 1} ${o.label}` }) }, o.short)));
   const hd = M.readSyncHeader(img());
   const n = M.syncCount(img());
-  const sync = hd.valid ? `FH-2 sync · ${['', 'USB', 'DIN', 'both'][hd.dest] ?? 'USB'} · scenes on ${hd.program >= 1 && hd.program <= 16 ? 'PC ch ' + hd.program : 'no PC'} · ${plural(n, 'knob')}`
+  const sync = hd.valid ? `FH-2 sync · ${({ 2: 'DIN', 3: 'both' })[hd.dest] ?? 'USB'} · scenes on ${hd.program >= 1 && hd.program <= 16 ? 'PC ch ' + hd.program : 'no PC'} · ${plural(n, 'knob')}`
     : hd.blank ? (n ? `FH-2: no header · ${plural(n, 'entry')}` : 'FH-2: none') : `FH-2: header ${toHex(hd.bytes.slice(0, 4))}?`;
   return h('div', { class: 'pagebar' },
     tabs,
@@ -739,6 +714,7 @@ function pageBar() {
 
 function selectPage(q) {
   S.sel.page = q;
+  S.sel.multi = null;
   renderAll();
 }
 
@@ -766,7 +742,7 @@ function cellBox(p, c) {
   const problem = sync ? M.syncProblem(sync, e, hd) : null;
   const flash = S.flash && S.flash.page === p && S.flash.cell === c ? ' flash' : '';
   const off = key ? pu.off : e.off && pu.off;
-  const cls = `cell ${key ? 'key' : 'knob'} ${!key && !e.off ? 'tc' + e.type : key && !pu.off ? 'tp' : 'toff'}` + (c === S.sel.cell ? ' sel' : '') + flash
+  const cls = `cell ${key ? 'key' : 'knob'} ${!key && !e.off ? 'tc' + e.type : key && !pu.off ? 'tp' : 'toff'}` + (c === S.sel.cell ? ' sel' : '') + (S.sel.multi?.has(c) ? ' msel' : '') + flash
     + (cellDirty(p, c) ? ' dirty' : '') + (S.imported?.cells.has(`${p}:${c}`) ? ' imp' : '') + (off ? ' off' : '');
   const badges = [
     !key && e.link && !e.off ? h('span', { class: 'link', title: 'linked to the next knob' }, '⟶') : null,
@@ -777,7 +753,7 @@ function cellBox(p, c) {
     ? keySummary(pu).map((t, k) => h('div', { class: k ? 'psum' : 'sum' }, t))
     : [h('div', { class: 'sum' }, M.encoderSummary(e)), !pu.off ? h('div', { class: 'psum' }, h('span', { class: 'pico' }, '●'), ' ', M.pushSummary(pu)) : null];
   const full = key ? M.pushSummary(pu) : M.encoderSummary(e) + (pu.off ? '' : ` · push: ${M.pushSummary(pu)}`);
-  return h('div', { class: cls, dataset: { c: String(c) }, onmousedown: (ev) => ev.button === 0 && selectCell(c), title: `${M.cellLabel(c)}: ${full}` },
+  return h('div', { class: cls, dataset: { c: String(c) }, onmousedown: (ev) => ev.button === 0 && clickCell(ev, c), title: `${M.cellLabel(c)}: ${full}` },
     h('div', { class: 'line1' }, h('span', { class: 'idx' }, idx), h('span', { class: 'nm' }, cell.name || (off ? '' : '····')), h('span', { class: 'badges' }, badges)),
     body);
 }
@@ -802,10 +778,45 @@ function keySummary(pu) {
 }
 
 function selectCell(c) {
-  if (S.sel.cell === c) return;
+  if (S.sel.cell === c && !S.sel.multi) return;
   S.sel.cell = c;
-  for (const el of document.querySelectorAll('#main .cell')) el.classList.toggle('sel', Number(el.dataset.c) === c);
+  S.sel.multi = null;
+  showSelection();
+}
+
+// ---- several cells (bulk editing): Shift-click a range, ⌘/Ctrl-click one more or less
+
+const selected = () => (S.sel.multi && S.sel.multi.size > 1 ? [...S.sel.multi].sort((a, b) => a - b) : [S.sel.cell]);
+
+// The boxes' marks and the inspector, without rebuilding the grid.
+function showSelection() {
+  for (const el of document.querySelectorAll('#main .cell')) {
+    const c = Number(el.dataset.c);
+    el.classList.toggle('sel', c === S.sel.cell);
+    el.classList.toggle('msel', !!S.sel.multi?.has(c));
+  }
   renderInspector();
+}
+
+function clickCell(ev, c) {
+  if (!ev.shiftKey && !ev.metaKey && !ev.ctrlKey) return selectCell(c);
+  ev.preventDefault(); // no text selection
+  let set;
+  if (ev.shiftKey) set = new Set(B.cellRange(S.sel.cell, c)); // the clicked cell stays the anchor's partner
+  else {
+    set = new Set(selected());
+    if (set.has(c) && set.size > 1) set.delete(c);
+    else set.add(c);
+  }
+  S.sel.multi = set.size > 1 ? set : null;
+  if (!ev.shiftKey) S.sel.cell = set.has(c) ? c : [...set][0];
+  showSelection();
+}
+
+function selectAll() {
+  const keys = M.isKey(S.sel.cell);
+  S.sel.multi = new Set(keys ? range(M.KNOBS, M.CELLS) : range(0, M.KNOBS));
+  showSelection();
 }
 
 // ---- inspector (Lilypad's cell editor)
@@ -872,7 +883,8 @@ function check(key, checked, enabled, label, onSet) {
 
 function renderInspector() {
   const el = $('#inspector');
-  if (S.view !== 'pages' || (!S.store.loaded && !S.conn)) return replace(el, h('div', { class: 'insp-empty' }, S.view === 'import' ? 'Pick the groups, then Import.' : ''));
+  if (S.view !== 'pages' || (!S.store.loaded && !S.conn) || (S.reading && !S.store.dev && !S.store.loaded)) return replace(el, h('div', { class: 'insp-empty' }, S.view === 'import' ? 'Pick the groups, then Import.' : ''));
+  if (selected().length > 1) return replace(el, bulkInspector(S.sel.page, selected()));
   const { page: p, cell: c } = S.sel;
   const cell = M.readCell(img(), p, c);
   const key = M.isKey(c);
@@ -946,6 +958,62 @@ function pushFields(p, c, pu) {
   out.push(row(r.upper.label ?? 'Upper', numField('pupper', pu.upper, 0, 127, set('upper'), !r.upper.enabled), { enabled: r.upper.enabled, hint: r.upper.enabled ? (r.upper.hint ?? '0–127') : '' }));
   out.push(row('Link', check('plink', pu.link, r.link.enabled, r.link.enabled ? `with ${key ? 'key' : 'push'} ${(key ? c - M.KNOBS : c) + 2}` : key ? 'last key' : 'last knob', set('link')), { enabled: r.link.enabled }));
   return out;
+}
+
+// Several cells: what applies to all of them at once (bulk.js). Each field shows the first
+// selected cell's value it applies to; a change sets every cell it applies to.
+function bulkInspector(p, cells) {
+  const clip = getClip();
+  const knobs = cells.filter((c) => !M.isKey(c));
+  const first = (kind, field) => cells.find((c) => B.fieldApplies(img(), p, c, kind, field));
+  const set = (kind, field) => (v) => {
+    let n = 0;
+    edit(() => (n = B.applyField(img(), p, cells, kind, field, v)), { label: `${field} of ${plural(cells.length, 'cell')}` });
+    say(n ? `Set on ${plural(n, 'cell')}.` : 'No selected cell uses that.', n ? 'ok' : 'error');
+  };
+  const doFill = (kind, field) => {
+    let n = 0;
+    edit(() => (n = B.fill(img(), p, cells, kind, field)), { label: `fill ${field}s` });
+    say(n ? `Filled ${field}s ascending on ${plural(n, 'cell')}. ⌘Z undoes it.` : 'No selected cell uses that.', n ? 'ok' : 'error');
+  };
+  const field = (kind, f, label, control) => {
+    const c = first(kind, f);
+    return c === undefined ? null : row(label, control(B.readField(img(), p, c, kind, f), set(kind, f)));
+  };
+  const title = h('div', { class: 'insp-title' },
+    h('span', { class: 'big' }, `${cells.length} cells`),
+    h('span', { class: 'where' }, `Page ${p + 1}`),
+    h('span', { class: 'acts' },
+      h('button', { class: 'small', onclick: copyCell, title: 'Copy them (⌘C)' }, 'Copy'),
+      h('button', { class: 'small', onclick: pasteCell, disabled: !clip, title: clip ? `Paste ${clip.from} (⌘V)` : 'Nothing copied' }, 'Paste'),
+      h('button', { class: 'small', onclick: () => edit(() => cells.forEach((c) => (M.clearCell(img(), p, c), c < M.KNOBS && M.removeSync(img(), p, c))), { label: `clear ${plural(cells.length, 'cell')}` }) }, 'Clear'),
+      h('button', { class: 'small', onclick: () => selectCell(S.sel.cell), title: 'Esc' }, 'One')));
+  const types = [...M.ENC_TYPES.map((t, v) => ({ value: v, label: t.label })), { value: M.T.OFF, label: 'Off' }];
+  const ptypes = M.PUSH_TYPES.map((t, v) => ({ value: v, label: t.label }));
+  const parts = [title, h('p', { class: 'hint' }, `${cells.map((c) => (M.isKey(c) ? 'K' : '') + ((M.isKey(c) ? c - M.KNOBS : c) + 1)).join(' ')} · a change sets each cell it applies to`)];
+  if (knobs.length) {
+    parts.push(h('h3', {}, 'Turn'), h('div', { class: 'bulk-acts' },
+      h('button', { class: 'small', onclick: () => doFill('enc', 'channel'), title: 'Channels ascending from the first' }, 'Fill channels'),
+      h('button', { class: 'small', onclick: () => doFill('enc', 'number'), title: 'Numbers ascending from the first' }, 'Fill numbers')),
+    h('div', { class: 'fields' },
+      field('enc', 'type', 'Type', (v, on) => selectField('btype', types, v, on)),
+      field('enc', 'channel', 'Channel', (v, on) => selectField('bchannel', channelOptions(), v, on)),
+      field('enc', 'lower', 'Lower', (v, on) => numField('blower', v, 0, M.HIRES_MAX, on)),
+      field('enc', 'upper', 'Upper', (v, on) => numField('bupper', v, 0, M.HIRES_MAX, on)),
+      field('enc', 'scale', 'Display', (v, on) => selectField('bscale', M.SCALES.map((t, k) => ({ value: k, label: t.label })), v, on)),
+      field('enc', 'mode', 'Mode', (v, on) => selectField('bmode', M.MODES.map((t, k) => ({ value: k, label: `${t.short} — ${t.label}` })), v, on))));
+  }
+  parts.push(h('h3', {}, knobs.length === cells.length ? 'Push' : knobs.length ? 'Push and keys' : 'Keys'), h('div', { class: 'bulk-acts' },
+    h('button', { class: 'small', onclick: () => doFill('push', 'channel') }, 'Fill channels'),
+    h('button', { class: 'small', onclick: () => doFill('push', 'number') }, 'Fill numbers')),
+  h('div', { class: 'fields' },
+    field('push', 'type', 'Type', (v, on) => selectField('bptype', ptypes, v, on)),
+    field('push', 'channel', 'Channel', (v, on) => selectField('bpchannel', channelOptions(), v, on)),
+    field('push', 'mode', 'Mode', (v, on) => selectField('bpmode', M.PUSH_MODES.map((t, k) => ({ value: k, label: t.label })), v, on)),
+    field('push', 'lower', 'Lower', (v, on) => numField('bplower', v, 0, 127, on)),
+    field('push', 'upper', 'Upper', (v, on) => numField('bpupper', v, 0, 127, on)),
+    field('push', 'display', 'Display', (v, on) => check('bpdisplay', v, true, 'shows the state', on))));
+  return parts;
 }
 
 function syncPanel(p, c, e) {
@@ -1153,13 +1221,19 @@ function moveSel(d) {
 function onKey(ev) {
   const mod = ev.metaKey || ev.ctrlKey;
   const key = ev.key.toLowerCase();
-  if (mod && !ev.altKey && (key === 'z' || key === 'y') && !ev.target.closest('dialog')) {
+  if (mod && !ev.altKey && (key === 'z' || key === 'y')) {
     ev.preventDefault();
     return undoRedo(key === 'y' || ev.shiftKey);
   }
-  if (ev.target.closest('input, select, textarea, dialog') || S.view !== 'pages' || (!S.store.loaded && !S.conn)) return;
+  if (ev.target.closest('input, select, textarea') || S.view !== 'pages' || (!S.store.loaded && !S.conn)) return;
   const moves = { ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down' };
-  if (ev.key in moves) {
+  if (mod && !ev.altKey && key === 'a') {
+    ev.preventDefault();
+    selectAll(); // the page's knobs, or its keys
+  } else if (ev.key === 'Escape' && S.sel.multi) {
+    ev.preventDefault();
+    selectCell(S.sel.cell);
+  } else if (ev.key in moves) {
     ev.preventDefault();
     moveSel(moves[ev.key]);
   } else if (ev.key === 'PageDown' || ev.key === 'PageUp' || (ev.key >= '1' && ev.key <= '4' && !mod)) {

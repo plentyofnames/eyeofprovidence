@@ -60,13 +60,16 @@ export class Store {
     this.ram?.set(bytes, addr);
   }
 
-  // RELOAD answered 21: the BCR32 uses and keeps what its RAM holds; nothing is the editor's own.
+  // RELOAD answered 21: the BCR32 uses and keeps what its RAM holds. What it holds is no longer
+  // the editor's own; an edit made while the Send ran (not in what was written) still is, so a
+  // Read keeps it (review, 2026-11-08: it was dropped).
   committed() {
     if (this.ram) {
       this.dev = Uint8Array.from(this.ram);
       this.live = Uint8Array.from(this.ram);
     }
-    this.touched.clear();
+    const dev = this.dev;
+    this.touched = new Set(dev ? [...this.touched].filter((a) => this.img[a] !== dev[a]) : []);
   }
 
   // RELOAD answered 7F 24 04: the BCR32 uses what its RAM holds, but could not keep it.

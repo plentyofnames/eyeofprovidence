@@ -10,6 +10,8 @@ import { MockBcr32 } from '../js/mock.js';
 import { History } from '../js/history.js';
 import { demoImage, fakeNightShiftEc4 } from '../js/demo.js';
 import * as I from '../js/import.js';
+import * as B from '../js/bulk.js';
+import { LiveLink } from '../js/live.js';
 import * as E from '../js/ec4/model.js';
 import { Device as Ec4Device } from '../js/ec4/device.js';
 import { MockDevice as MockEc4 } from '../js/ec4/mock.js';
@@ -790,6 +792,134 @@ test('defaults: a blank knob switched to 14-bit gets the whole range; a note key
   eq(pu.lower, 64, 'a note key sends its note off at velocity 64');
   M.setPush(img, 0, M.keyCell(4), 'type', M.PT.CC);
   eq(M.readCell(img, 0, M.keyCell(4)).push.lower, 0, 'a CC key: off value 0');
+});
+
+// ---- the review's open items (2026-11-09)
+
+test('bulk: one field on every cell it applies to; fill channels and numbers ascending', () => {
+  const img = M.blankImage();
+  for (const c of [0, 1, 2, 3]) M.setEncoder(img, 1, c, 'type', M.T.CCAB);
+  M.setEncoder(img, 1, 2, 'type', M.T.PBND); // no number
+  eq(B.applyField(img, 1, [0, 1, 2, 3, 4], 'enc', 'channel', 9), 4, 'channel on the four knobs with an encoder (knob 5 is off)');
+  assert([0, 1, 2, 3].every((c) => M.readCell(img, 1, c).enc.channel === 9) && M.readCell(img, 1, 4).enc.off, 'knob 5 left alone');
+  M.setEncoder(img, 1, 0, 'channel', 14);
+  eq(B.fill(img, 1, [0, 1, 2, 3], 'enc', 'channel'), 4);
+  eq([0, 1, 2, 3].map((c) => M.readCell(img, 1, c).enc.channel).join(','), '14,15,0,1', 'channels 15, 16, 1, 2: wrapped');
+  M.setEncoder(img, 1, 0, 'number', 126);
+  eq(B.fill(img, 1, [0, 1, 2, 3], 'enc', 'number'), 3, 'numbers: PB has none');
+  eq([0, 1, 3].map((c) => M.readCell(img, 1, c).enc.number).join(','), '126,127,0');
+  M.setEncoder(img, 1, 5, 'type', M.T.CCAH);
+  M.setEncoder(img, 1, 6, 'type', M.T.CCAH);
+  M.setEncoder(img, 1, 5, 'number', 31);
+  B.fill(img, 1, [5, 6], 'enc', 'number');
+  eq(M.readCell(img, 1, 6).enc.number, 0, 'a 14-bit MSB wraps at 31');
+  for (const j of [0, 1]) M.setPush(img, 1, M.keyCell(j), 'type', M.PT.CC);
+  eq(B.applyField(img, 1, [M.keyCell(0), M.keyCell(1)], 'push', 'type', M.PT.ACC0), 0, 'no encoder push type on keys');
+  eq(B.cellRange(30, 34).join(','), '30,31', 'a range from a knob stays on the knobs');
+});
+
+test('bulk: copy several cells, paste them from the first target on; one into many', () => {
+  const img = M.blankImage();
+  for (const c of [0, 1, 2]) (M.setEncoder(img, 0, c, 'type', M.T.CCAB), M.setEncoder(img, 0, c, 'number', 20 + c), M.setName(img, 0, c, `K${c}`));
+  M.setEncoder(img, 0, 1, 'link', 1);
+  const recs = B.copyCells(img, 0, [2, 0, 1]);
+  eq(recs.length, 3);
+  eqBytes(B.pasteCells(img, 2, [29], recs), [29, 30, 31], 'three from knob 30 on');
+  eq(M.readCell(img, 2, 30).enc.number, 21);
+  eq(M.readCell(img, 2, 31).name, 'K2');
+  eq(B.pasteCells(img, 2, [30], recs).length, 2, 'as many as fit: knob 32 is the last');
+  assert(!M.readCell(img, 2, 31).enc.link, 'no link on the last knob');
+  eqBytes(B.pasteCells(img, 3, [4, 7, 9], [recs[0]]), [4, 7, 9], 'one into every target');
+  assert([4, 7, 9].every((c) => M.readCell(img, 3, c).enc.number === 20), 'all knob 1\'s');
+});
+
+test('live link: edits of the page in view go by EDIT, again after a page change, back on drop', async () => {
+  const mock = new MockBcr32(demoImage(), { speed: 'fast' });
+  const dev = connect(mock);
+  const info = await dev.identify();
+  const store = new Store();
+  store.fromDevice(await dev.readAll());
+  const ctx = { conn: { dev, info }, devState: await dev.getState(), liveEdit: true, store };
+  const live = new LiveLink(() => ctx);
+  eq(ctx.devState.page, 0);
+  M.setName(store.img, 0, 3, 'LIVE');
+  M.setName(store.img, 1, 5, 'P2');
+  await live.sync();
+  await until(() => mock.edits.size >= 1);
+  eq(mock.edits.size, 1, 'only the page in view');
+  eq(M.readName(mock.record(3), 8).trimEnd(), 'LIVE', 'knob 4 plays the edit');
+  await live.sync();
+  eq(mock.stats.edits, 1, 'nothing sent twice');
+  mock.setPage(1);
+  ctx.devState = await dev.getState();
+  live.reset();
+  await live.sync();
+  await until(() => mock.edits.has(5));
+  eq(M.readName(mock.record(5), 8).trimEnd(), 'P2', 'page 2 plays its edit');
+  await live.drop();
+  await until(() => !mock.edits.size || M.readName(mock.record(5), 8).trimEnd() !== 'P2');
+  assert(M.readName(mock.record(5), 8).trimEnd() !== 'P2', 'dropped: the stored cell plays again');
+  ctx.liveEdit = false;
+  M.setName(store.img, 1, 6, 'OFF');
+  const before = mock.stats.edits;
+  await live.sync();
+  eq(mock.stats.edits, before, 'Play edits off: nothing sent');
+  dev.close();
+});
+
+test('history: steps with the same key in quick succession merge; another key or a pause does not', () => {
+  const img = M.blankImage();
+  const hst = new History(img, { mergeMs: 1000 });
+  hst.record(() => M.setName(img, 0, 0, 'A'), { key: 'n0', now: 0 });
+  hst.record(() => M.setName(img, 0, 0, 'AB'), { key: 'n0', now: 500 });
+  eq(hst.done.length, 1, 'typing merges');
+  hst.record(() => M.setName(img, 0, 1, 'X'), { key: 'n1', now: 600 });
+  hst.record(() => M.setName(img, 0, 0, 'ABC'), { key: 'n0', now: 700 });
+  eq(hst.done.length, 3, 'another key in between: a step of its own');
+  hst.record(() => M.setName(img, 0, 0, 'ABCD'), { key: 'n0', now: 5000 });
+  eq(hst.done.length, 4, 'after a pause: a new step');
+  hst.undo();
+  hst.undo();
+  hst.undo();
+  hst.undo();
+  eq(M.readCell(img, 0, 0).name, '', 'all undone');
+  const a = M.cellAddr(0, 9);
+  const was = img[a];
+  hst.record(() => (img[a] = 0x21), { key: 'z', now: 9000 });
+  hst.record(() => (img[a] = was), { key: 'z', now: 9100 });
+  eq(hst.done.length, 0, 'a merge that puts everything back leaves no step');
+});
+
+test('store: an edit made while a Send runs stays the editor\'s own after RELOAD', () => {
+  const store = new Store();
+  store.fromDevice(demoImage());
+  M.setName(store.img, 0, 0, 'SENT');
+  store.touch(M.cellAddrs(0, 0));
+  for (const c of store.deviceChunks()) store.written(c.addr, c.data);
+  M.setName(store.img, 0, 1, 'LATE'); // meanwhile
+  store.touch(M.cellAddrs(0, 1));
+  store.committed();
+  const data = Uint8Array.from(store.dev);
+  store.fromDevice(data); // a Read
+  eq(M.readCell(store.img, 0, 1).name, 'LATE', 'the late edit is kept');
+  assert(store.deviceDirtyBytes() > 0, 'and still to send');
+  eq(M.readCell(store.img, 0, 0).name, 'SENT');
+});
+
+test('sync: a band entry with table B byte 0 past 127 is not used (as the firmware)', () => {
+  const img = M.blankImage();
+  img.set([0x46, 0x48, 0x32, 2, 0, 1, 1, 1], M.A.SYNC);
+  M.setEncoder(img, 0, 0, 'type', M.T.CCAB);
+  const a = (2 << 12) | 0x100;
+  img[M.syncAAddr(0, 0)] = a >> 8;
+  img[M.syncAAddr(0, 0) + 1] = a & 0xFF;
+  img[M.syncBAddr(0, 0)] = 0x85;
+  img[M.syncBAddr(0, 0) + 1] = 0;
+  const hd = M.readSyncHeader(img);
+  const s = M.readSync(img, 0, 0);
+  assert(M.syncProblem(s, M.readCell(img, 0, 0).enc, hd), 'bit 7 set: a problem');
+  img[M.syncBAddr(0, 0)] = 0x05;
+  eq(M.syncProblem(M.readSync(img, 0, 0), M.readCell(img, 0, 0).enc, hd), null, '5 bands: used');
 });
 
 // load(path) returns a file's bytes, or null (for optional local files; none needed now).

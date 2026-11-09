@@ -598,6 +598,7 @@ export function syncProblem(s, e, header) {
   const need = SYNC_TYPES[s.type].needs;
   if (e.type !== need) return `needs ${ENC_TYPES[need].short}`;
   if ((s.type === 2 || s.type === 3) && s.b[0] === 0xFF && s.b[1] === 0xFF) return 'no table B entry';
+  if (s.type === 2 && s.b[0] & 0x80) return 'table B byte 0 past 127'; // as the firmware's usable()
   if (s.type === 2 && !s.n) return 'no bands';
   const last = s.type === 0 ? 0xFFE : s.type === 3 ? 0xFFC : 0xFFF;
   if (s.offset > last) return 'offset past the dump';

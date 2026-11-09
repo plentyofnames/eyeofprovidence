@@ -27,21 +27,25 @@ export const $ = (sel, root = document) => root.querySelector(sel);
 
 // Replaces the children of `el`, keeping focus (and the caret) on the element with the
 // same data-key if there was one.
-// A text input being typed in also keeps its text, so the model's padded form (names are
-// stored as 4 characters) doesn't overwrite what the user is typing. Only while the new
-// value is the same up to trailing spaces: if the box now shows another name (the device
-// moved to another group), the typed text is dropped instead of landing there.
+// A text input being typed in also keeps its text, so a redraw doesn't overwrite what the
+// user is typing: when the new value is the typed text up to trailing spaces (names are
+// stored as 4 characters), or when it is still the value the box was drawn with (a box that
+// commits on change, redrawn for something else before that). If the box now shows another
+// value (the device moved to another page), the typed text is dropped instead of landing there.
+// (Lilypad e1f3d8b.)
 export function replace(el, ...children) {
   const active = document.activeElement;
   const key = active && el.contains(active) ? active.dataset.key : null;
   const caret = key && 'selectionStart' in active ? [active.selectionStart, active.selectionEnd] : null;
   const typed = key && active.tagName === 'INPUT' && active.type === 'text' ? active.value : null;
+  const drawn = typed !== null ? active.defaultValue : null;
   el.replaceChildren();
   append(el, children);
   if (key) {
     const again = el.querySelector(`[data-key="${CSS.escape(key)}"]`);
     if (again) {
-      if (typed !== null && again.type === 'text' && again.value.trimEnd() === typed.trimEnd()) again.value = typed;
+      const same = (a, b) => a.trimEnd() === b.trimEnd();
+      if (typed !== null && again.type === 'text' && (same(again.value, typed) || same(again.value, drawn))) again.value = typed;
       again.dataset.restoring = '1'; // tells focus handlers this is not a new focus
       again.focus({ preventScroll: true });
       delete again.dataset.restoring;
@@ -61,26 +65,4 @@ export function download(bytes, name) {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 5000);
-}
-
-// Promise-based modal on a <dialog>. buttons: [{label, value, primary}]
-export function modal(dialog, { title, body, buttons }) {
-  return new Promise((resolve) => {
-    const done = (v) => {
-      dialog.close();
-      resolve(v);
-    };
-    dialog.replaceChildren(
-      h('form', { method: 'dialog', class: 'modal', onsubmit: (e) => e.preventDefault() },
-        h('h2', {}, title),
-        h('div', { class: 'modal-body' }, body),
-        h('div', { class: 'modal-buttons' },
-          buttons.map((b) => h('button', { type: 'button', class: b.primary ? 'primary' : b.danger ? 'danger' : '', onclick: () => done(b.value) }, b.label)))));
-    dialog.oncancel = (e) => {
-      e.preventDefault();
-      done(null);
-    };
-    dialog.showModal();
-    dialog.querySelector('button.primary')?.focus();
-  });
 }

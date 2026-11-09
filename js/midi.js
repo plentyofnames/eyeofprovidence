@@ -28,14 +28,21 @@ export function midiTransport(input, output) {
     name: output.name,
     output, // its .state tells when the unit is unplugged
     onmessage: null,
+    ondisconnect: null, // the unit went away (unplugged): set by the app
     send(bytes) {
       output.send(bytes);
     },
     close() {
       input.onmidimessage = null;
+      input.onstatechange = null;
+      output.onstatechange = null;
     },
   };
   input.onmidimessage = (e) => port.onmessage?.(e.data);
+  // Unplugging is noticed at once, not at the next Send (review, 2026-11-08; as Lilypad)
+  const gone = (e) => e.port?.state === 'disconnected' && port.ondisconnect?.();
+  input.onstatechange = gone;
+  output.onstatechange = gone;
   return port;
 }
 
