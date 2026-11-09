@@ -794,6 +794,22 @@ test('defaults: a blank knob switched to 14-bit gets the whole range; a note key
   eq(M.readCell(img, 0, M.keyCell(4)).push.lower, 0, 'a CC key: off value 0');
 });
 
+test('names in words, as on the BCR32 and in Night Shift (not the EC4\'s 4 letters)', () => {
+  const img = M.blankImage();
+  M.setEncoder(img, 0, 0, 'type', M.T.CCAB);
+  M.setEncoder(img, 0, 0, 'channel', 15);
+  M.setEncoder(img, 0, 0, 'number', 20);
+  eq(M.encoderSummary(M.readCell(img, 0, 0).enc), 'CC 20 ch16');
+  M.setEncoder(img, 0, 1, 'type', M.T.PBND);
+  eq(M.encoderSummary(M.readCell(img, 0, 1).enc), 'Pitch bend ch1');
+  M.setEncoder(img, 0, 2, 'type', M.T.CCAH);
+  assert(M.encoderSummary(M.readCell(img, 0, 2).enc).startsWith('CC 14-bit '), 'CC 14-bit');
+  M.setPush(img, 0, M.keyCell(0), 'type', M.PT.PRGC);
+  assert(M.pushSummary(M.readCell(img, 0, M.keyCell(0)).push).startsWith('Prog change'), 'a key\'s program change');
+  eq(M.MODES[3].label, 'No acceleration');
+  assert(M.ENC_TYPES.every((t) => !/^(PB|AT|PC|CCAb|CCAh|PrgC|PBnd|AftT)$/.test(t.short)), 'no EC4 abbreviations');
+});
+
 // ---- the review's open items (2026-11-09)
 
 test('bulk: one field on every cell it applies to; fill channels and numbers ascending', () => {

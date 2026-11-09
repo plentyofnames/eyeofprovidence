@@ -761,14 +761,14 @@ function cellBox(p, c) {
 // A key's push in two short lines: what it sends, then the channel and mode.
 function keySummary(pu) {
   if (pu.off) return ['off'];
-  const ch = `ch${pu.channel + 1}${pu.mode && pu.type <= M.PT.AFTT ? ' tgl' : ''}`;
+  const ch = `ch${pu.channel + 1}${pu.mode && pu.type <= M.PT.AFTT ? ' toggle' : ''}`;
   switch (pu.type) {
     case M.PT.NOTE:
       return [`Note ${M.noteName(pu.number)}`, ch];
     case M.PT.CC:
-      return [`CC #${pu.number}`, ch];
+      return [`CC ${pu.number}`, ch];
     case M.PT.PRGC:
-      return [`PrgC ${pu.number}`, ch];
+      return [`Prog change ${pu.number}`, ch];
     case M.PT.PBND:
     case M.PT.AFTT:
       return [M.PUSH_TYPES[pu.type].short, ch];
@@ -928,7 +928,7 @@ function encoderFields(p, c, e) {
   out.push(row('Upper', numField('upper', e.upper, 0, lu.max, set('upper'), !lu.enabled), { enabled: lu.enabled, hint: luHint }));
   out.push(row('Display', selectField('scale', M.SCALES.map((t, v) => ({ value: v, label: t.label })), e.scale, set('scale')),
     { note: e.type === M.T.PBND || e.type === M.T.NRPN ? '14-bit with off, 1000, ±500, 9999.' : null }));
-  out.push(row('Mode', selectField('mode', M.MODES.map((t, v) => ({ value: v, label: `${t.short} — ${t.label}` })), e.mode, set('mode'), !r.mode.enabled), { enabled: r.mode.enabled }));
+  out.push(row('Mode', selectField('mode', M.MODES.map((t, v) => ({ value: v, label: t.label })), e.mode, set('mode'), !r.mode.enabled), { enabled: r.mode.enabled }));
   out.push(row('Link', check('link', e.link, r.link.enabled, r.link.enabled ? `with knob ${c + 2}` : 'last knob', set('link')), { enabled: r.link.enabled }));
   const warn = [];
   if (e.rawMode !== e.mode) warn.push(`mode ${e.rawMode} plays as ${M.MODES[e.mode].short}`);
@@ -1001,7 +1001,7 @@ function bulkInspector(p, cells) {
       field('enc', 'lower', 'Lower', (v, on) => numField('blower', v, 0, M.HIRES_MAX, on)),
       field('enc', 'upper', 'Upper', (v, on) => numField('bupper', v, 0, M.HIRES_MAX, on)),
       field('enc', 'scale', 'Display', (v, on) => selectField('bscale', M.SCALES.map((t, k) => ({ value: k, label: t.label })), v, on)),
-      field('enc', 'mode', 'Mode', (v, on) => selectField('bmode', M.MODES.map((t, k) => ({ value: k, label: `${t.short} — ${t.label}` })), v, on))));
+      field('enc', 'mode', 'Mode', (v, on) => selectField('bmode', M.MODES.map((t, k) => ({ value: k, label: t.label })), v, on))));
   }
   parts.push(h('h3', {}, knobs.length === cells.length ? 'Push' : knobs.length ? 'Push and keys' : 'Keys'), h('div', { class: 'bulk-acts' },
     h('button', { class: 'small', onclick: () => doFill('push', 'channel') }, 'Fill channels'),
@@ -1225,7 +1225,7 @@ function onKey(ev) {
     ev.preventDefault();
     return undoRedo(key === 'y' || ev.shiftKey);
   }
-  if (ev.target.closest('input, select, textarea') || S.view !== 'pages' || (!S.store.loaded && !S.conn)) return;
+  if (ev.target.closest?.('input, select, textarea') || S.view !== 'pages' || (!S.store.loaded && !S.conn)) return;
   const moves = { ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down' };
   if (mod && !ev.altKey && key === 'a') {
     ev.preventDefault();

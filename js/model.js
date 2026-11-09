@@ -76,31 +76,34 @@ export function isBlank(img) {
 
 // ---------------------------------------------------------------- value tables (Lilypad's)
 
-// Plain names (the EC4's own in the comments): CCR1, CCR2, CCAb, PrgC, CCAh, PBnd, AftT, Note, NRPN.
+// Names in words (your call, 2026-11-09: more room than the EC4's 4 letters; the same table in
+// Night Shift's BCR32 tab and on the BCR32's screen). The EC4's own: CCR1, CCR2, CCAb, PrgC,
+// CCAh, PBnd, AftT, Note, NRPN.
 export const ENC_TYPES = [
-  { short: 'rel CC', label: 'CC relative (1 / 127)' },
-  { short: 'rel CC', label: 'CC relative (63 / 65)' },
-  { short: 'CC', label: 'CC' },
-  { short: 'PC', label: 'Program change' },
-  { short: '14-bit CC', label: 'CC 14-bit (n and n + 32)' },
-  { short: 'PB', label: 'Pitch bend' },
-  { short: 'AT', label: 'Aftertouch' },
-  { short: 'Note', label: 'Note' },
+  { short: 'CC rel', label: 'CC relative (1 up, 127 down)' },
+  { short: 'CC rel', label: 'CC relative (65 up, 63 down)' },
+  { short: 'CC', label: 'Control change (CC)' },
+  { short: 'Prog change', label: 'Program change' },
+  { short: 'CC 14-bit', label: 'CC 14-bit (n and n + 32)' },
+  { short: 'Pitch bend', label: 'Pitch bend' },
+  { short: 'Aftertouch', label: 'Aftertouch' },
+  { short: 'Note', label: 'Note (on / off)' },
   { short: 'NRPN', label: 'NRPN' },
 ];
 export const T = { CCR1: 0, CCR2: 1, CCAB: 2, PRGC: 3, CCAH: 4, PBND: 5, AFTT: 6, NOTE: 7, NRPN: 8, OFF: 15 };
 
+// The EC4's: Div8, Div4, Div2, Acc0-Acc3, LSp2, LSp4, LSp6
 export const MODES = [
-  { short: 'Div8', label: 'Division by 8' },
-  { short: 'Div4', label: 'Division by 4' },
-  { short: 'Div2', label: 'Division by 2' },
-  { short: 'Acc0', label: 'No acceleration' },
-  { short: 'Acc1', label: 'Low acceleration' },
-  { short: 'Acc2', label: 'Mid acceleration' },
-  { short: 'Acc3', label: 'Max acceleration' },
-  { short: 'LSp2', label: 'Large step 2' },
-  { short: 'LSp4', label: 'Large step 4' },
-  { short: 'LSp6', label: 'Large step 6' },
+  { short: '÷8', label: 'Divide by 8' },
+  { short: '÷4', label: 'Divide by 4' },
+  { short: '÷2', label: 'Divide by 2' },
+  { short: 'no accel', label: 'No acceleration' },
+  { short: 'accel low', label: 'Acceleration low' },
+  { short: 'accel mid', label: 'Acceleration mid' },
+  { short: 'accel max', label: 'Acceleration max' },
+  { short: 'steps of 2', label: 'Steps of 2' },
+  { short: 'steps of 4', label: 'Steps of 4' },
+  { short: 'steps of 6', label: 'Steps of 6' },
 ];
 export const MODE_OTHER = 5; // "Others count as Acc2"
 
@@ -118,26 +121,27 @@ export const SCALES = [
 export const SCALE_OTHER = 1; // not in the spec: as controlfrog's loader, 0 … 127
 const HIRES_SCALES = new Set([0, 3, 6, 8]); // off, 1000, ±500, 9999
 
+// The EC4's: Off, Note, CC, PrgC, PBnd, AftT, Grp, Set, Acc0, Acc3, LSp6, Min, Max
 export const PUSH_TYPES = [
-  { short: 'Off', label: 'Off' },
+  { short: 'off', label: 'Off' },
   { short: 'Note', label: 'Note' },
-  { short: 'CC', label: 'Control change' },
-  { short: 'PC', label: 'Program change' },
-  { short: 'PB', label: 'Pitch bend' },
-  { short: 'AT', label: 'Aftertouch' },
+  { short: 'CC', label: 'Control change (CC)' },
+  { short: 'Prog change', label: 'Program change' },
+  { short: 'Pitch bend', label: 'Pitch bend' },
+  { short: 'Aftertouch', label: 'Aftertouch' },
   { short: 'Page', label: 'Page select' },
-  { short: 'Set', label: 'Set (does nothing here)' },
-  { short: 'Acc0', label: 'Acceleration off while held' },
-  { short: 'Acc3', label: 'Max acceleration while held' },
-  { short: 'LSp6', label: 'Large step 6 while held' },
-  { short: 'Min', label: 'Set to lower value' },
-  { short: 'Max', label: 'Set to upper value' },
+  { short: 'Set', label: 'Set (does nothing)' },
+  { short: 'no accel held', label: 'No acceleration while held' },
+  { short: 'max accel held', label: 'Max acceleration while held' },
+  { short: 'steps of 6 held', label: 'Steps of 6 while held' },
+  { short: 'to lower', label: 'Set to lower value' },
+  { short: 'to upper', label: 'Set to upper value' },
 ];
 export const PT = { OFF: 0, NOTE: 1, CC: 2, PRGC: 3, PBND: 4, AFTT: 5, GRP: 6, SET: 7, ACC0: 8, ACC3: 9, LSP6: 10, MIN: 11, MAX: 12 };
 
 export const PUSH_MODES = [
-  { short: 'Key', label: 'Key (momentary)' },
-  { short: 'Togl', label: 'Toggle' },
+  { short: 'momentary', label: 'Momentary (key)' },
+  { short: 'toggle', label: 'Toggle' },
 ];
 
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
@@ -513,7 +517,7 @@ export function setName(img, p, c, value) {
 // Short one-line summaries for the grid.
 export function encoderSummary(e) {
   if (e.off) return 'off';
-  // what tells knobs apart first (the box cuts the end off): "CC20 ch16", "14-bit CC1 ch16"
+  // what tells knobs apart first (the box cuts the end off): "CC 20 ch16", "CC 14-bit 1 ch16"
   const t = ENC_TYPES[e.type].short;
   const ch = `ch${e.channel + 1}`;
   switch (e.type) {
@@ -526,18 +530,18 @@ export function encoderSummary(e) {
     case T.AFTT:
       return `${t} ${ch}`;
     default:
-      return `${t}${e.number} ${ch}`;
+      return `${t} ${e.number} ${ch}`;
   }
 }
 export function pushSummary(p) {
   if (p.off) return 'off';
   const t = PUSH_TYPES[p.type].short;
-  const m = p.mode ? ' tgl' : '';
+  const m = p.mode ? ' toggle' : '';
   switch (p.type) {
     case PT.NOTE:
       return `${t} ${noteName(p.number)} ch${p.channel + 1}${m}`;
     case PT.CC:
-      return `${t}${p.number} ch${p.channel + 1}${m}`;
+      return `${t} ${p.number} ch${p.channel + 1}${m}`;
     case PT.GRP:
       return `→ page ${(p.channel & 3) + 1}`;
     case PT.PRGC:
