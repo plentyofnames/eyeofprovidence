@@ -116,8 +116,8 @@ test('space 3, the tracks (0.29): READ, read-only, 35 on a change, the FH-2 sync
   const head = await dev.read(0, 256, P.SPACE.TRACKS);
   const rest = await dev.read(256, 16, P.SPACE.TRACKS);
   eqBytes(head.slice(0, 4), [1, 16, 16, 0], 'the head: version, tracks, bytes a track, counter');
-  eqBytes(head.slice(16 + 16 * 3, 16 + 16 * 3 + 8), [3, 0, 0, 1, 74, 1, 71, 0], 'track 4: channel 4, M303, USB, CC 74, CC 71');
-  eqBytes(rest.slice(0, 3), [15, 0, 0], 'track 16 in the second READ');
+  eqBytes(head.slice(16 + 16 * 3, 16 + 16 * 3 + 8), [3, 4, 0, 1, 74, 1, 71, 0], 'track 4: channel 4, off (a fresh unit, 0.30), USB, CC 74, CC 71');
+  eqBytes(rest.slice(0, 3), [15, 4, 0], 'track 16 in the second READ');
   await throws(() => dev.read(260, 16, P.SPACE.TRACKS), /bad range/, 'past 272: range');
   assert(!mock.syncOff, 'READ 3 leaves the FH-2 sync on');
   const seen = [];
@@ -126,7 +126,7 @@ test('space 3, the tracks (0.29): READ, read-only, 35 on a change, the FH-2 sync
   await until(() => seen.length === 1);
   eq(seen[0].counter, 1, '35 1');
   const again = await dev.read(16 + 16 * 5, 16, P.SPACE.TRACKS);
-  eqBytes([again[0], again[1], again[2], again[10]], [11, 3, 2, 128], 'track 6 read again: channel 12, Plaits, DIN B, no TIMBRE CC');
+  eqBytes([again[0], again[1], again[2], again[10]], [11, 3, 2, 128], 'track 6 read again: channel 12, Plaits Chords, DIN B, no TIMBRE CC');
   dev.close();
   const replies = [];
   const t = mock.transport();

@@ -10,12 +10,12 @@ import * as M from './model.js';
 
 const MODE = { SEQUENCER: 0, CONTROLLER: 1 };
 
-// Space 3 as a fresh unit has it: track n on channel n, M303, USB, CC 74 and 71, a Plaits' chord
-// CC 20 and TIMBRE CC 21, slide and accent notes 0 and 2.
-export function tracksImage(counter = 0) {
+// Space 3 as a fresh unit has it: track n on channel n, machine off (4; 0.29: 0, M303), USB,
+// CC 74 and 71, a Plaits Chords' chord CC 20 and TIMBRE CC 21, slide and accent notes 0 and 2.
+export function tracksImage(counter = 0, machine = 4) {
   const b = new Uint8Array(TRACKS_LEN).fill(0xFF);
   b.set([1, 16, 16, counter & 0x7F], 0);
-  for (let t = 0; t < 16; t++) b.set([t, 0, 0, 1, 74, 1, 71, 0, 20, 0, 21, 0, 0, 2], 16 + 16 * t);
+  for (let t = 0; t < 16; t++) b.set([t, machine, 0, 1, 74, 1, 71, 0, 20, 0, 21, 0, 0, 2], 16 + 16 * t);
   return b;
 }
 // a track's fields, by name, at their bytes
