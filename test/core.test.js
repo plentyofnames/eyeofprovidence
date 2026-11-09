@@ -651,12 +651,13 @@ test('live link: TOUCH and STATE events, EDIT for the page in view', async () =>
   const rec = M.readRecord(demoImage(), 2, 0);
   rec[8] = 0x58;
   await dev.edit(2, 0, rec);
-  await dev.edit(1, 0, rec); // another page: 7F 2C 01, as the firmware answers
+  await dev.edit(1, 0, rec); // another page: 7F 2C 06, as the firmware answers (0.27 on)
   await dev.edit(2, 48, rec); // bad cell: 7F 2C 01
   await until(() => errors.length >= 2 && mock.edits.size >= 1);
   eqBytes(mock.record(0), rec, 'EDIT applied');
   eq(mock.edits.size, 1);
-  assert(errors.length === 2 && errors.every((e) => e.cmd === 0x2C && e.code === 1), 'other page and bad cell: 7F 2C 01');
+  assert(errors.length === 2 && errors.every((e) => e.cmd === 0x2C) && errors[0].code === 6 && errors[1].code === 1,
+    'another page: 7F 2C 06; a bad cell: 7F 2C 01');
   await dev.select(2);
   eq(mock.edits.size, 1, 'SELECT of the page in view changes nothing: the edit stays');
   await dev.select(1);

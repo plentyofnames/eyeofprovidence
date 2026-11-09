@@ -274,9 +274,17 @@ async function connect() {
   S.conn = { dev, kind: target, name: transport.name, info: null };
   dev.addEventListener('state', onDeviceState);
   dev.addEventListener('touch', onDeviceTouch);
-  // An EDIT can cross a page change on the BCR32 (7F 2C 01): the new page's STATE resends it.
+  // An EDIT can cross a page change on the BCR32: the new page's STATE resends it. Rotary Club
+  // 0.27 says so as 7F 2C 06 (not the page in view): then ask which page it shows, in case that
+  // STATE was missed.
   const what = { 0x10: 'a read', 0x12: 'a write', 0x20: 'a state request', 0x22: 'a page select', 0x24: 'storing', 0x26: 'touch events', 0x28: 'a text', 0x2A: 'clearing texts' };
-  dev.addEventListener('deviceerror', (e) => e.detail.cmd !== 0x2C && say(`The BCR32 refused ${what[e.detail.cmd] ?? 'a message'} (error ${e.detail.code}).`, 'error'));
+  dev.addEventListener('deviceerror', (e) => {
+    if (e.detail.cmd === 0x2C) {
+      if (e.detail.code === 6) dev.getState().catch(() => {});
+      return;
+    }
+    say(`The BCR32 refused ${what[e.detail.cmd] ?? 'a message'} (error ${e.detail.code}).`, 'error');
+  });
   say(`Connecting to ${transport.name}…`);
   renderAll();
   try {

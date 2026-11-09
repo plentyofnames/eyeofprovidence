@@ -189,7 +189,7 @@ export class MockBcr32 {
         return;
       case CMD.EDIT:
         if (c.page > 3 || c.cell >= M.CELLS) return err(1);
-        if (c.page !== this.page) return err(1); // only the page in view (as the firmware answers)
+        if (c.page !== this.page) return err(6); // only the page in view (as the firmware answers, 0.27 on)
         this.edits.set(c.cell, c.record);
         this.stats.edits++;
         this._updated('edits');
