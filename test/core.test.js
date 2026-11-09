@@ -108,6 +108,35 @@ test('device replies decode', () => {
   eq(P.decodeReply(Uint8Array.from([0xF0, 0x7D, 0x45, 0x43, 0x34, 0x21, 0, 0, 0xF7])), null, 'EC4 message is not ours');
 });
 
+test('space 3, the tracks (0.29): READ, read-only, 35 on a change, the FH-2 sync left on', async () => {
+  const tr = P.decodeReply(P.device.tracks(0x85));
+  assert(tr.type === 'tracks' && tr.counter === 5, '35 decodes, 7-bit');
+  const mock = new MockBcr32(M.blankImage(), { fw: [0, 29], speed: 'fast' });
+  const dev = connect(mock);
+  const head = await dev.read(0, 256, P.SPACE.TRACKS);
+  const rest = await dev.read(256, 16, P.SPACE.TRACKS);
+  eqBytes(head.slice(0, 4), [1, 16, 16, 0], 'the head: version, tracks, bytes a track, counter');
+  eqBytes(head.slice(16 + 16 * 3, 16 + 16 * 3 + 8), [3, 0, 0, 1, 74, 1, 71, 0], 'track 4: channel 4, M303, USB, CC 74, CC 71');
+  eqBytes(rest.slice(0, 3), [15, 0, 0], 'track 16 in the second READ');
+  await throws(() => dev.read(260, 16, P.SPACE.TRACKS), /bad range/, 'past 272: range');
+  assert(!mock.syncOff, 'READ 3 leaves the FH-2 sync on');
+  const seen = [];
+  dev.addEventListener('tracks', (e) => seen.push(e.detail));
+  mock.setTrack(5, { channel: 11, machine: 3, output: 2, timbreCc: 128 });
+  await until(() => seen.length === 1);
+  eq(seen[0].counter, 1, '35 1');
+  const again = await dev.read(16 + 16 * 5, 16, P.SPACE.TRACKS);
+  eqBytes([again[0], again[1], again[2], again[10]], [11, 3, 2, 128], 'track 6 read again: channel 12, Plaits, DIN B, no TIMBRE CC');
+  dev.close();
+  const replies = [];
+  const t = mock.transport();
+  t.onmessage = (b) => replies.push(P.decodeReply(b));
+  t.send(P.host.write(0, [1], P.SPACE.TRACKS));
+  await until(() => replies.length >= 1);
+  assert(replies[0].type === 'write' && replies[0].space === 3 && replies[0].status === 1 && mock.tracks[0] === 1, 'WRITE 3: status 1');
+  assert(!mock.syncOff, 'nor does a WRITE to it');
+});
+
 test('WRITE: malformed is an error, bad checksum a status', () => {
   const good = P.host.write(0, [1, 2, 3]);
   const short = Uint8Array.from([...good.slice(0, -3), 0xF7]);

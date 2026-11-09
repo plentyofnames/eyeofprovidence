@@ -22,6 +22,7 @@ export const CMD = {
   EDIT: 0x2C,
   EVENT: 0x31, // M0's raw key and knob events: ignored
   TOUCH: 0x33,
+  TRACKS: 0x35, // the tracks (space 3) changed: 35 counter (firmware 0.29 on)
   ERROR: 0x7F,
 };
 
@@ -32,10 +33,12 @@ export const ERR = {
   3: 'busy',
   4: 'the image could not be stored', // RELOAD: in use until power-off, but not kept
   5: 'unknown command',
+  6: 'not the page in view', // EDIT, 0.27 on
 };
 export const ERR_STORE = 4;
 
-export const SPACE = { INTERNAL: 0, FLASH: 1, CONTROLLER: 2 };
+export const SPACE = { INTERNAL: 0, FLASH: 1, CONTROLLER: 2, TRACKS: 3 };
+export const TRACKS_LEN = 272; // space 3: a 16-byte head, 16 bytes a track (docs/controller-protocol.md)
 
 // WRITE's reply status (13 space addr status).
 export const WRITE_STATUS = { OK: 0, RANGE: 1, CHECKSUM: 2 };
@@ -163,6 +166,7 @@ export const device = {
   writeReply: (space, addr, status) => frame(CMD.WRITE_REPLY, [space & 0x7F, ...encodeNum(addr, ADDR_GROUPS), status & 0x7F]),
   state: (mode, page) => frame(CMD.STATE, [mode & 0x7F, page & 0x7F]),
   touch: (kind, index, page) => frame(CMD.TOUCH, [kind & 0x7F, index & 0x7F, page & 0x7F]),
+  tracks: (counter) => frame(CMD.TRACKS, [counter & 0x7F]),
   error: (cmd, code) => frame(CMD.ERROR, [cmd & 0x7F, code & 0x7F]),
 };
 
@@ -200,6 +204,9 @@ export function decodeReply(msg) {
     case CMD.TOUCH:
       if (body.length < 3) return bad('short TOUCH');
       return { type: 'touch', kind: body[0], index: body[1], page: body[2] };
+    case CMD.TRACKS:
+      if (body.length < 1) return bad('short TRACKS');
+      return { type: 'tracks', counter: body[0] };
     case CMD.EVENT:
       return { type: 'event', body };
     case CMD.ERROR:
@@ -279,6 +286,8 @@ export function describeReply(r) {
       return `STATE ${r.mode === 1 ? 'controller' : r.mode === 0 ? 'sequencer' : 'mode ' + r.mode}, page ${r.page + 1}`;
     case 'touch':
       return `TOUCH ${['turn', 'push', 'key'][r.kind] ?? 'kind ' + r.kind} ${r.index + 1} (page ${r.page + 1})`;
+    case 'tracks':
+      return `TRACKS changed (${r.counter})`;
     case 'event':
       return 'EVENT (raw)';
     case 'error':

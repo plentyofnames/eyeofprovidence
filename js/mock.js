@@ -5,10 +5,21 @@
 // in view changes nothing (0.24: its EDITs stay). One request at a time: a request that arrives
 // while one is being handled is answered 7F cmd 03 (busy).
 
-import { CMD, SPACE, MAX_CHUNK, WRITE_STATUS, device as reply, decodeCommand } from './proto.js';
+import { CMD, SPACE, MAX_CHUNK, TRACKS_LEN, WRITE_STATUS, device as reply, decodeCommand } from './proto.js';
 import * as M from './model.js';
 
 const MODE = { SEQUENCER: 0, CONTROLLER: 1 };
+
+// Space 3 as a fresh unit has it: track n on channel n, M303, USB, CC 74 and 71, a Plaits' chord
+// CC 20 and TIMBRE CC 21, slide and accent notes 0 and 2.
+export function tracksImage(counter = 0) {
+  const b = new Uint8Array(TRACKS_LEN).fill(0xFF);
+  b.set([1, 16, 16, counter & 0x7F], 0);
+  for (let t = 0; t < 16; t++) b.set([t, 0, 0, 1, 74, 1, 71, 0, 20, 0, 21, 0, 0, 2], 16 + 16 * t);
+  return b;
+}
+// a track's fields, by name, at their bytes
+const TRACK_FIELDS = { channel: 0, machine: 1, output: 2, aType: 3, aNum: 4, bType: 5, bNum: 6, muted: 7, chordTrim: 9, timbreCc: 10, timbreTrim: 11 };
 
 export class MockBcr32 {
   // speed 'usb' = a few ms per message (scaled by timeScale), 'fast' = no delays.
@@ -22,6 +33,7 @@ export class MockBcr32 {
     this.mode = MODE.CONTROLLER;
     this.page = 0;
     this.touchOn = false;
+    this.tracks = tracksImage(); // space 3, read-only (0.29)
     this.handling = false;
     this.edits = new Map(); // cell -> record, for the page in view (EDIT)
     this.texts = [new Map(), new Map()]; // labels, value texts: cell -> 4 characters
@@ -114,7 +126,8 @@ export class MockBcr32 {
     const err = (code) => (noReply ? this._event(reply.error(c.cmd, code)) : this._reply(reply.error(c.cmd, code)));
     if (!noReply) this.handling = true;
     if (c.error) return err(c.error);
-    if (c.cmd !== CMD.IDENTIFY && !(c.cmd === CMD.READ && c.space !== SPACE.CONTROLLER)) this.syncOff = true;
+    // IDENTIFY, a backup's or the tracks' READ and a refused WRITE elsewhere leave the FH-2 sync on
+    if (c.cmd !== CMD.IDENTIFY && !((c.cmd === CMD.READ || c.cmd === CMD.WRITE) && c.space !== SPACE.CONTROLLER)) this.syncOff = true;
     switch (c.cmd) {
       case CMD.IDENTIFY: {
         const info = Uint8Array.from([0x52, 0x43, ...new Array(48).fill(0)]); // "RC", then M0's fields
@@ -126,6 +139,9 @@ export class MockBcr32 {
         if (c.space === SPACE.CONTROLLER) {
           if (c.addr + c.len > M.SIZE) return err(2);
           data = this.ram.slice(c.addr, c.addr + c.len);
+        } else if (c.space === SPACE.TRACKS) {
+          if (c.addr + c.len > TRACKS_LEN) return err(2);
+          data = this.tracks.slice(c.addr, c.addr + c.len);
         } else if (c.space === SPACE.INTERNAL || c.space === SPACE.FLASH) {
           data = new Uint8Array(c.len).fill(c.space === SPACE.FLASH ? 0xFF : 0);
         } else return err(2);
@@ -232,6 +248,19 @@ export class MockBcr32 {
     this.lastTouch.set(key, now);
     this._event(reply.touch(kind, index, this.page));
     return true;
+  }
+
+  // a track's setup changed on the unit ({channel, machine, output, ...}): the counter goes up,
+  // 35 counter to the host (the firmware sends at most one a second; the mock at once)
+  setTrack(t, fields) {
+    const r = 16 + 16 * t;
+    for (const [k, v] of Object.entries(fields)) {
+      if (!(k in TRACK_FIELDS)) throw new Error(`no track field ${k}`);
+      this.tracks[r + TRACK_FIELDS[k]] = v & 0xFF;
+    }
+    this.tracks[3] = (this.tracks[3] + 1) & 0x7F;
+    this._updated('tracks');
+    this._event(reply.tracks(this.tracks[3]));
   }
 
   powerCycle() {

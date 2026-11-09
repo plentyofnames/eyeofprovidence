@@ -57,6 +57,7 @@ export class Device extends EventTarget {
     }
     if (r.type === 'state') this._emit('state', { mode: r.mode, page: r.page, solicited: !!p && p.match(r) });
     if (r.type === 'touch') this._emit('touch', r);
+    if (r.type === 'tracks') this._emit('tracks', r);
   }
 
   _settle(err, value, retryable = false) {
